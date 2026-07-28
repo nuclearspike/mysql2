@@ -343,9 +343,9 @@ recorded evidence is affected; it mattered only for the upstream-contribution pa
 
 ```lssd
 decision_record decision_record.mysql2.rowmat.keep_stack {
-  decision: "Keep the full v8 optimization stack + bug fixes on branch lssd/perf as the lab result; candidate upstream contribution as two PRs (bug fixes; optimizations) remains UNDECIDED pending Paul's authorization."
+  decision: "Paul authorized upstream engagement 2026-07-28 (\"go for it\"). Executed: PR https://github.com/brianmario/mysql2/pull/1452 (zero/partial-zero dates, references #963, supersedes #1054 with credit) and PR https://github.com/brianmario/mysql2/pull/1453 (fieldTypes GC-mark + freed-result UAF guards) submitted from clean single-concern branches off d4f8c13; complementary review comments posted on PR #1450 (GC-mark gap composition note) and PR #1422 (streaming as-array #fields regression report + measured complementary optimizations offer); no-repro triage note posted on issue #963. Perf stack remains lab-only pending #1422 coordination. Both PR packages passed pre-submission hub review (prioritized + adversarial; revision re-reviewed CLEAN); review round contributed the ALLOW_INVALID_DATES parity spec, tightened message asserts, alias coverage, sql_mode restoration, GC/compaction regression spec, and exposed that non-streaming stmt results are fully materialized at execute time (spec now documents all three free-inside-block behaviors)."
   state: active
-  authority: { mode: human, owner: "Paul Ericksen", note: "drafted by session agent; lab-result scope only - upstream submission explicitly NOT authorized by this record" }
+  authority: { mode: human, owner: "Paul Ericksen", note: "upstream submission authorized verbally in-session 2026-07-28" }
   decidedAt: "2026-07-28"
   basedOn: [@finding.mysql2.rowmat.h1_utc_fastpath, @finding.mysql2.rowmat.percell_overhead, @finding.mysql2.rowmat.h6_dead_capacity, @finding.mysql2.rowmat.upstream_bugs]
   alternatives: ["Cherry-pick only the datetime fast path (largest single win) - rejected: the other wins are independent, spec-clean and additive", "Fast-path :local timezone too - rejected for now: DST/TZ-env semantic risk documented in finding.mysql2.rowmat.local_tz_dominates"]
