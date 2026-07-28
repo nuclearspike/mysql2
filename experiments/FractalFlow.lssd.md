@@ -32,13 +32,14 @@ reference_set reference_set.mysql2.bench_tables {
 
 benchmark benchmark.mysql2.row_materialization {
   label: "mysql2 row materialization wall-time + allocation benchmark"
-  version: "1.0.0"
+  version: "1.1.0"
+  changeNote: "1.0.0 plus additive :utc workloads (datetimes_utc_q, mixed_utc_q, datetimes_utc_stmt); deviation recorded in trial.mysql2.rowmat.v1_to_v8_steps"
   maturity: active
   semantic: {
     question: "How do mysql2 C-extension variants compare on full-result materialization time, object allocations, and peak memory?"
     referenceSet: @reference_set.mysql2.bench_tables
     referenceSetVersion: "1.0.0"
-    referenceSetFingerprint: "sha256:795bc5db6b3f4ae7d4a3c6f0bafdb0fb5ba1cc01f2fc1d4d5b9b095df3998120"
+    referenceSetFingerprint: "sha256:babe8f1754a5e350bf719c1959f8b14238bc40509d83ededbd3bf46c25b84387"
     thresholds: { significance: "delta > 3x pooled MAD and > 3 percent", spec_suite: "must pass" }
     metrics: ["median_ms per workload (15 reps after 3 warmups)", "MAD_ms", "total_allocated_objects delta per materialization", "RSS delta KB for t_big cache_rows:false full iteration"]
     protocol: [
@@ -109,6 +110,7 @@ experiment experiment.mysql2.rowmat_hotpath {
 ```lssd
 experiment_trial trial.mysql2.rowmat.v0_baseline of @experiment.mysql2.rowmat_hotpath {
   experimentVersion: "1.0.0"
+  experimentFingerprint: "sha256:7d6de9ae6af62328a6fc16d722d70876debc041f2c28abe7fec731ad9c59964c"
   trialOutcome: completed
   occurredAt: "2026-07-28T07:05:00Z"
   variant: v0_baseline
@@ -152,3 +154,215 @@ evidence evidence.mysql2.rowmat.v0_baseline.metrics {
 Baseline reading (informal): datetime casting dominates (370ms vs 61ms for the same 50k rows;
 ~1.2us per DATETIME cell through rb_funcall Time.utc). H6 confirmed pre-patch: rows array holds a
 16,384,040-byte capacity buffer with 0 elements under cache_rows:false on t_big.
+
+```lssd
+experiment_trial trial.mysql2.rowmat.v1_to_v8_steps of @experiment.mysql2.rowmat_hotpath {
+  experimentVersion: "1.0.0"
+  experimentFingerprint: "sha256:7d6de9ae6af62328a6fc16d722d70876debc041f2c28abe7fec731ad9c59964c"
+  trialOutcome: completed
+  occurredAt: "2026-07-28T07:10:00Z/09:40:00Z"
+  variant: "v1_bugfixes through v8_lazy_rows_alloc, cumulative stack, one optimization per step"
+  executions: ["bench-v1_bugfixes-{1..3}", "bench-v2_field_hoist-{1..3}", "bench-v3_enc_cache-{1..3}", "bench-v4_dt_fastpath-{1..4}", "bench-v5_hash_capa-{1..3}", "bench-v6_int_fastpath-{1..3}", "bench-v7_stmt_bind_once-{1..3}", "bench-v8_lazy_rows_alloc-1", "membench-v8_lazy_rows_alloc", "bench-v0_baseline-{4..6} (pristine worktree, adds :utc workloads)"]
+  inputs: [{ role: workload, reference_set: @reference_set.mysql2.bench_tables }]
+  resolvedParameters: { warmup: 3, reps: 15, alloc_reps: 3 }
+  environment: { base: "same as trial.mysql2.rowmat.v0_baseline", branch: "lssd/perf", bugfix_commit: "2d2d680", perf_commit: "33f8239" }
+  outputs: ["experiments/artifacts/bench-v{1..8}_*.json + membench-v8_lazy_rows_alloc.json, sha256 prefixes 06a296eb 9955d8d3 1cf04071 1ca6b66d 5c4269a0 9bc29ef4 ffafff1f 6fc63d5b f564af07 cc4cb805 d706ece5 a06ce717 11195f3b 0c2ee1cd 797bc11d 9e20731f 75f2f2db b8174f0c 18093bb7 94d429b8 787f00fc b1eb5781 84d5a153 94be1b3d"]
+  evidence: [@evidence.mysql2.rowmat.final_ab.metrics]
+  verdicts: {
+    execution: passed, integrity: passed,
+    spec_suite: "green at every step (355 -> 358 examples as regression specs were added), 0 failures",
+    v1_bugfixes: "perf-neutral within +-3.5pct as predicted",
+    v2_field_hoist: "ints -6.4pct, stmt ints -3.2pct; noise elsewhere",
+    v3_enc_cache: "strings -12.3pct, cast:false -12pct; no regression",
+    v4_dt_fastpath: "datetimes_utc text 117.4->92.9ms (-20.9pct), stmt 81.0->60.6ms (-25.2pct) vs pristine-worktree baseline; :local untouched by design",
+    v5_hash_capa: "ints -7pct, strings -3.5pct, wide -4pct vs v4",
+    v6_int_fastpath: "ints -15.1pct vs v5",
+    v7_stmt_bind_once: "stmt workloads improved (share overlaps v5); no regression",
+    v8_lazy_rows_alloc: "rows_array_memsize 16384040 -> 40 bytes on 2M-row cache_rows:false; timing neutral"
+  }
+  deviations: ["Benchmark protocol extended mid-experiment to 1.1.0: database_timezone :utc workloads (datetimes_utc_q, mixed_utc_q, datetimes_utc_stmt) added at v4 when it emerged that the gem default :local exercises Time.local, not the fast path target; pristine-worktree v0 runs 4-6 provided the missing :utc baselines", "Registry trial entries batched after implementation instead of per-step; all per-step artifacts were written and hashed at execution time", "v8 timing captured with 1 run instead of 3 (its timing surface is identical to v7; the final interleaved A/B provides 4 more full-stack runs)"]
+  status: observed
+  confidence: 0.95
+}
+
+experiment_trial trial.mysql2.rowmat.final_ab of @experiment.mysql2.rowmat_hotpath {
+  experimentVersion: "1.0.0"
+  experimentFingerprint: "sha256:7d6de9ae6af62328a6fc16d722d70876debc041f2c28abe7fec731ad9c59964c"
+  trialOutcome: completed
+  occurredAt: "2026-07-28T09:45:00Z"
+  variant: "v0_baseline (pristine worktree at d4f8c13) vs v8 full stack (33f8239), interleaved A/B"
+  executions: ["4 interleaved run-pairs: bench-v0_final_ab-{11..14} / bench-v8_final_ab-{11..14}"]
+  inputs: [{ role: workload, reference_set: @reference_set.mysql2.bench_tables }]
+  resolvedParameters: { warmup: 3, reps: 15, pairs: 4, order: "ABABABAB to neutralize thermal drift" }
+  environment: { same as baseline trial; v0 lib from git worktree ../mysql2-v0 }
+  outputs: ["sha256 prefixes: v0 22bfb858 a34207da 0b91477b 6f2a61f4; v8 caac7bfb 882163a3 f9494ea0 09e5bbc2"]
+  evidence: [@evidence.mysql2.rowmat.final_ab.metrics]
+  verdicts: { execution: passed, integrity: passed, timing: passed, allocation_reduction: failed, memory_bytes: passed, spec_suite: passed }
+  deviations: []
+  status: observed
+  confidence: 1.0
+}
+
+evidence evidence.mysql2.rowmat.final_ab.metrics {
+  kind: measurement
+  occurredAt: "2026-07-28T09:45:00Z"
+  subject: @trial.mysql2.rowmat.final_ab
+  method: "median of 4 interleaved runs per side, each run = median of 15 reps after 3 warmups"
+  value: {
+    medians_ms_v0_vs_v8: {
+      ints_q: [63.3, 49.1], strings_q: [84.1, 74.9], datetimes_q: [388.3, 387.9],
+      mixed_q: [193.7, 175.2], wide_q: [86.0, 82.3], mixed_array_q: [166.3, 160.0],
+      mixed_nocast_q: [88.4, 76.6], mixed_symbolized_q: [180.2, 170.8],
+      datetimes_utc_q: [122.9, 97.6], mixed_utc_q: [120.0, 98.4],
+      ints_stmt: [66.0, 48.8], datetimes_stmt: [348.5, 337.5], mixed_stmt: [190.8, 179.0],
+      datetimes_utc_stmt: [90.7, 64.6]
+    }
+    deltas_pct: { ints_q: -22.5, strings_q: -10.9, datetimes_q: -0.1, mixed_q: -9.5, wide_q: -4.3, mixed_array_q: -3.8, mixed_nocast_q: -13.4, mixed_symbolized_q: -5.2, datetimes_utc_q: -20.6, mixed_utc_q: -18.0, ints_stmt: -26.1, datetimes_stmt: -3.1, mixed_stmt: -6.2, datetimes_utc_stmt: -28.8 }
+    allocs_delta: "0 across all workloads (object counts unchanged; wins are CPU-per-cell)"
+    membench_v8: { rows_array_memsize_bytes: 40, was: 16384040 }
+  }
+  provenance: { artifacts: "experiments/artifacts/bench-v{0,8}_final_ab-{11..14}.json" }
+  integrity: { sha256: "prefixes recorded in the trial outputs", verification: "reference-set row counts + checksums matched; both sides ran identical harness rev" }
+  scope: ["mysql2 d4f8c13 vs 33f8239", "reference_set 1.0.0", "Apple M5 Max / Ruby 3.3.11 / MySQL 9.6.0 / macOS Darwin 25.5.0"]
+  status: observed
+  confidence: 1.0
+}
+```
+
+## Findings
+
+```lssd
+finding finding.mysql2.rowmat.h1_utc_fastpath {
+  claim: "Replacing rb_funcall(Time.utc, 7 args) with C civil-to-epoch + rb_time_timespec_new cuts :utc datetime materialization 20.6pct (text) and 25-29pct (binary/stmt); it does not reach the hypothesized 25pct on the text path because sscanf parsing and row overhead remain."
+  strength: supported
+  basedOn: [@evidence.mysql2.rowmat.v0_baseline.metrics, @evidence.mysql2.rowmat.final_ab.metrics]
+  scope: ["database_timezone :utc only; :local deliberately untouched", "reference_set 1.0.0", "Apple M5 Max / Ruby 3.3.11 / MySQL 9.6"]
+  supports: ["H1 partially: stmt exceeded target, text fell short of 25pct at -20.6pct"]
+  contradicts: []
+  limitations: ["Single machine, single MySQL version", "Time.utc equivalence verified by spec across range edges but not exhaustively fuzzed"]
+  invalidatedBy: ["Ruby changing rb_time_timespec_new semantics", "reference-set change"]
+  status: inferred
+  confidence: 0.9
+}
+
+finding finding.mysql2.rowmat.local_tz_dominates {
+  claim: "With the gem-default database_timezone :local, Time.local conversion dominates datetime casting (~370ms vs ~117ms for :utc on identical baseline data, 3.2x): the biggest remaining optimization surface in mysql2 datetime handling is the :local path, not funcall overhead."
+  strength: supported
+  basedOn: [@evidence.mysql2.rowmat.v0_baseline.metrics, @evidence.mysql2.rowmat.final_ab.metrics]
+  scope: ["reference_set 1.0.0", "Apple M5 Max / Ruby 3.3.11"]
+  supports: ["Prioritizing a :local fast path as follow-up work"]
+  contradicts: ["The tacit assumption that funcall overhead was the datetime bottleneck for all timezone configs"]
+  limitations: ["A C fast path for :local must reproduce Ruby's own DST-gap and TZ-env semantics exactly; risk documented, not attempted"]
+  invalidatedBy: ["Ruby Time.local implementation changes"]
+  status: inferred
+  confidence: 0.92
+}
+
+finding finding.mysql2.rowmat.percell_overhead {
+  claim: "Per-cell fixed overhead (field-name lookup chain, per-cell encoding table lookup, per-row hash growth, per-row stmt rebind, per-value rb_cstr2inum) is 22-26pct of integer-workload wall time; eliminating it (H2+H3+H4+H5+H7 combined) yields ints -22.5pct (text) and -26.1pct (stmt) with zero object-allocation change."
+  strength: supported
+  basedOn: [@evidence.mysql2.rowmat.final_ab.metrics]
+  scope: ["reference_set 1.0.0", "cumulative stack; per-step shares recorded in trial.mysql2.rowmat.v1_to_v8_steps verdicts"]
+  supports: ["H2 (strings -10.9 to -12.3pct)", "H3 (small, broad)", "H4 (broad, biggest single step on ints at -7pct)", "H5 (stmt share)", "H7 (ints -15.1pct step)"]
+  contradicts: ["H-alloc expectation: the successCriteria line 'allocs on t_mixed reduced >=10pct' FAILED - allocation counts are driven entirely by value objects and did not move; the wins are CPU per cell, not fewer objects"]
+  limitations: ["Attribution between H4 and H5 on stmt workloads overlaps; not isolated further"]
+  invalidatedBy: ["Ruby hash/string internals changes", "reference-set change"]
+  status: inferred
+  confidence: 0.9
+}
+
+finding finding.mysql2.rowmat.h6_dead_capacity {
+  claim: "With cache_rows: false, mysql2 reserved full-result rows-array capacity it never used (8 bytes/row: 16,384,040 bytes on a 2M-row iteration); allocating lazily removes it entirely (40 bytes) with no timing regression."
+  strength: supported
+  basedOn: [@evidence.mysql2.rowmat.v0_baseline.metrics, @evidence.mysql2.rowmat.final_ab.metrics]
+  scope: ["reference_set 1.0.0 t_big", "any result iterated with cache_rows: false"]
+  supports: ["H6 fully"]
+  contradicts: []
+  limitations: ["RSS-level effect is masked by libmysqlclient's own store_result buffer (~167MB for t_big), which dwarfs the Ruby-side saving; the win is real but secondary to the C-library buffering for total memory"]
+  invalidatedBy: ["Semantics change to rows caching"]
+  status: inferred
+  confidence: 0.95
+}
+
+finding finding.mysql2.rowmat.upstream_bugs {
+  claim: "Upstream HEAD d4f8c13 ships four result.c bugs: (A) each(symbolize_keys: true) silently ignored when query options did not set it (regression from #1427's eager field fetch); (B) field_types raises after free on exhausted empty results despite #1427 intending otherwise - its own spec fails; (C) binary-protocol zero dates raise Date::Error where text protocol returns nil; (D) wrapper->fieldTypes never GC-marked/compacted - latent use-after-free reachable via GC.compact or any GC between field_types calls; plus (E) each() after manual free() dereferences the freed MYSQL_RES (returned 0 rows from freed memory in repro)."
+  strength: supported
+  basedOn: [@evidence.mysql2.rowmat.v0_baseline.metrics]
+  scope: ["mysql2 d4f8c13, MySQL 9.6, Ruby 3.3.11; A and B reproduced by upstream's own spec suite, C and E by targeted repro scripts in-session"]
+  supports: ["All five fixed in commit 2d2d680 (A-D) and 33f8239-adjacent guard (E), suite 358/358 green"]
+  contradicts: []
+  limitations: ["D verified by code inspection (missing mark) rather than a crash repro; the class of defect is deterministic from the GC contract"]
+  invalidatedBy: ["Upstream fixing these independently"]
+  status: inferred
+  confidence: 0.95
+}
+```
+
+## Decision record (draft - authorization gate: Paul)
+
+```lssd
+decision_record decision_record.mysql2.rowmat.keep_stack {
+  decision: "Keep the full v8 optimization stack + bug fixes on branch lssd/perf as the lab result; candidate upstream contribution as two PRs (bug fixes; optimizations) remains UNDECIDED pending Paul's authorization."
+  state: active
+  authority: { mode: human, owner: "Paul Ericksen", note: "drafted by session agent; lab-result scope only - upstream submission explicitly NOT authorized by this record" }
+  decidedAt: "2026-07-28"
+  basedOn: [@finding.mysql2.rowmat.h1_utc_fastpath, @finding.mysql2.rowmat.percell_overhead, @finding.mysql2.rowmat.h6_dead_capacity, @finding.mysql2.rowmat.upstream_bugs]
+  alternatives: ["Cherry-pick only the datetime fast path (largest single win) - rejected: the other wins are independent, spec-clean and additive", "Fast-path :local timezone too - rejected for now: DST/TZ-env semantic risk documented in finding.mysql2.rowmat.local_tz_dominates"]
+  consequences: ["Lab narrative gains a Ruby/C exhibit: 10-29pct on a 16-year-old, heavily-optimized driver", "Upstream PRs require hub double-review per standing rule before submission"]
+  revisitWhen: ["Paul reviews the session report", "Upstream review feedback arrives", "Ruby 3.4+ hash/time internals change", "MariaDB-client verification runs (mariadb_field_attr path only compile-tested here)"]
+  supersedes: []
+  status: confirmed
+  confidence: 0.85
+}
+```
+
+## Leave-behinds
+
+```lssd
+heuristic heuristic.mysql2.bench_tz_config {
+  version: "1.0.0"
+  maturity: active
+  semantic: {
+    statement: "When benchmarking or optimizing mysql2 datetime paths, pin database_timezone explicitly and measure :utc and :local separately."
+    appliesWhen: ["Any mysql2 datetime-casting benchmark or optimization work"]
+    avoidWhen: ["Workloads with no temporal columns"]
+    rationale: ["The gem default (:local) and the Rails default (:utc) differ 3.2x in baseline cost and take entirely different code paths (Time.local conversion vs Time.utc construction)"]
+    examples: ["This experiment's mid-flight benchmark 1.1.0 correction after :local defaults masked the fast-path target"]
+    counterexamples: []
+    confidenceBoundary: ["Measured on Apple Silicon / Ruby 3.3; ratio may shift across Ruby versions"]
+    verification: [@benchmark.mysql2.row_materialization]
+    promotionCriteria: ["Fold into the lab's standard benchmark checklist if it recurs on another driver"]
+  }
+  knowledge: {
+    scope: ["mysql2 datetime casting, any platform"]
+    evidence: [@finding.mysql2.rowmat.local_tz_dominates]
+    owner: "popular-repos lab"
+    learnedAt: "2026-07-28"
+    invalidatedBy: ["Ruby Time.local cost profile changes materially"]
+    supersedes: []
+  }
+  status: inferred
+  confidence: 0.9
+}
+
+opportunity opportunity.mysql2.local_tz_fastpath {
+  opportunityState: proposed
+  outcome: "A :local-timezone datetime fast path bringing :local casting toward :utc cost (~3.2x headroom)"
+  actors: ["popular-repos lab", "mysql2 upstream maintainers"]
+  problemEvidence: [@finding.mysql2.rowmat.local_tz_dominates]
+  expectedValue: ["Up to ~70pct reduction in datetime casting cost for the gem-default :local configuration, the single largest remaining surface"]
+  dependencies: ["Exact parity with Ruby Time.local across DST gaps/overlaps, runtime TZ env changes, and historic offsets"]
+  risks: ["A semantic divergence from Time.local silently corrupts timestamps - worst-case failure mode for a database driver"]
+  nextDecision: "Decide whether to prototype behind an opt-in flag with a DST-transition differential fuzz harness (Time.local vs fast path over full tzdata transition tables)"
+  knowledge: {
+    scope: ["mysql2 text and binary datetime casting, database_timezone :local"]
+    evidence: [@finding.mysql2.rowmat.local_tz_dominates]
+    owner: "popular-repos lab (unassigned)"
+    learnedAt: "2026-07-28"
+    invalidatedBy: ["Problem disappears via Ruby-side Time.local optimization", "Risk assessed as exceeding value"]
+    supersedes: []
+  }
+  status: inferred
+  confidence: 0.85
+}
+```
