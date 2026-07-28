@@ -298,6 +298,20 @@ finding finding.mysql2.rowmat.upstream_bugs {
 }
 ```
 
+## Post-conclusion hardening (2026-07-28)
+
+Portability defect found while reviewing version constraints, after the final A/B:
+`mysql2_utc_time` cast an int64 epoch into `timespec.tv_sec` (time_t) unchecked. On
+32-bit time_t platforms (legacy mingw32, 32-bit Linux/musl without 64-bit time), dates
+outside 1901-2038 would silently truncate to wrong Time values where the generic
+Time.utc path was correct. Fixed with a narrowing round-trip check that returns Qnil
+and falls back to the funcall path; on 64-bit time_t the check constant-folds away.
+Sanity evidence: bench-v8_timet_guard-1.json (datetimes_utc_q 98.571ms,
+datetimes_utc_stmt 54.272ms, ints_q 44.880ms - all within noise of the final A/B
+medians), suite 358/358 green, 0 compiler warnings. Scope note: the defect was
+unreachable in this lab's measured environment (Apple Silicon, 64-bit time_t), so no
+recorded evidence is affected; it mattered only for the upstream-contribution path.
+
 ## Decision record (draft - authorization gate: Paul)
 
 ```lssd

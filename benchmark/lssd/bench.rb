@@ -33,7 +33,7 @@ def mad(a)
   median(a.map { |x| (x - m).abs })
 end
 
-WORKLOADS = {}.freeze
+WORKLOADS = {} # rubocop:disable Style/MutableConstant -- populated by workload() below
 
 def workload(name, &blk)
   WORKLOADS[name] = blk
@@ -52,7 +52,7 @@ workload('mixed_symbolized_q') { |c| c.query('SELECT * FROM t_mixed', symbolize_
 workload('datetimes_utc_q') { |c| c.query('SELECT * FROM t_datetimes', database_timezone: :utc).to_a }
 workload('mixed_utc_q')     { |c| c.query('SELECT * FROM t_mixed', database_timezone: :utc).to_a }
 
-STMTS = {}.freeze
+STMTS = {} # rubocop:disable Style/MutableConstant -- memoized prepared statements
 workload('ints_stmt')      { |c| (STMTS['ints'] ||= c.prepare('SELECT * FROM t_ints')).execute.to_a }
 workload('datetimes_stmt') { |c| (STMTS['datetimes'] ||= c.prepare('SELECT * FROM t_datetimes')).execute.to_a }
 workload('mixed_stmt')     { |c| (STMTS['mixed'] ||= c.prepare('SELECT * FROM t_mixed')).execute.to_a }

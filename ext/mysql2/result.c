@@ -554,13 +554,21 @@ static inline int64_t mysql2_days_from_civil(int64_t y, unsigned int m, unsigned
  * Time.utc(year, month, day, hour, min, sec, usec) for in-range wall-clock
  * components, without the varargs dispatch and per-argument boxing. Callers
  * must validate hour/min/sec ranges (Time.utc raises on out-of-range values,
- * epoch math would silently wrap them). */
+ * epoch math would silently wrap them).
+ *
+ * Returns Qnil when the epoch value does not fit in time_t (32-bit time_t
+ * platforms, for dates outside 1901-2038); callers must then fall back to the
+ * generic Time.utc path, which handles arbitrary years. On 64-bit time_t
+ * platforms the check folds away at compile time. */
 static VALUE mysql2_utc_time(unsigned int year, unsigned int month, unsigned int day,
                              unsigned int hour, unsigned int min, unsigned int sec,
                              unsigned long usec) {
   struct timespec ts;
-  ts.tv_sec = (time_t)(mysql2_days_from_civil((int64_t)year, month, day) * 86400LL
-                       + hour * 3600 + min * 60 + sec);
+  const int64_t secs = mysql2_days_from_civil((int64_t)year, month, day) * 86400LL
+                       + hour * 3600 + min * 60 + sec;
+  const time_t narrowed = (time_t)secs;
+  if ((int64_t)narrowed != secs) return Qnil;
+  ts.tv_sec = narrowed;
   ts.tv_nsec = (long)(usec * 1000UL);
   return rb_time_timespec_new(&ts, INT_MAX - 1);
 }
@@ -808,6 +816,8 @@ static VALUE rb_mysql_result_fetch_row_stmt(VALUE self, MYSQL_FIELD * fields, co
 #ifdef HAVE_RB_TIME_TIMESPEC_NEW
           if (MYSQL2_UTC_FAST_PATH_OK(args->db_timezone, ts->hour, ts->minute, ts->second)) {
             val = mysql2_utc_time(2000, 1, 1, ts->hour, ts->minute, ts->second, ts->second_part);
+          }
+          if (!NIL_P(val)) {
             /* app_timezone :utc needs no conversion: the value is UTC already */
             if (args->app_timezone == intern_local) {
               val = rb_funcall(val, intern_localtime, 0);
@@ -858,6 +868,8 @@ static VALUE rb_mysql_result_fetch_row_stmt(VALUE self, MYSQL_FIELD * fields, co
 #ifdef HAVE_RB_TIME_TIMESPEC_NEW
             if (MYSQL2_UTC_FAST_PATH_OK(args->db_timezone, ts->hour, ts->minute, ts->second)) {
               val = mysql2_utc_time(ts->year, ts->month, ts->day, ts->hour, ts->minute, ts->second, ts->second_part);
+            }
+            if (!NIL_P(val)) {
               /* app_timezone :utc needs no conversion: the value is UTC already */
               if (args->app_timezone == intern_local) {
                 val = rb_funcall(val, intern_localtime, 0);
@@ -1018,6 +1030,8 @@ static VALUE rb_mysql_result_fetch_row(VALUE self, MYSQL_FIELD * fields, const r
 #ifdef HAVE_RB_TIME_TIMESPEC_NEW
           if (MYSQL2_UTC_FAST_PATH_OK(args->db_timezone, hour, min, sec)) {
             val = mysql2_utc_time(2000, 1, 1, hour, min, sec, msec);
+          }
+          if (!NIL_P(val)) {
             /* app_timezone :utc needs no conversion: the value is UTC already */
             if (args->app_timezone == intern_local) {
               val = rb_funcall(val, intern_localtime, 0);
@@ -1075,6 +1089,8 @@ static VALUE rb_mysql_result_fetch_row(VALUE self, MYSQL_FIELD * fields, const r
 #ifdef HAVE_RB_TIME_TIMESPEC_NEW
                 if (MYSQL2_UTC_FAST_PATH_OK(args->db_timezone, hour, min, sec)) {
                   val = mysql2_utc_time(year, month, day, hour, min, sec, msec);
+                }
+                if (!NIL_P(val)) {
                   /* app_timezone :utc needs no conversion: the value is UTC already */
                   if (args->app_timezone == intern_local) {
                     val = rb_funcall(val, intern_localtime, 0);
