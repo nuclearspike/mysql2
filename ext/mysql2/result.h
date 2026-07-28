@@ -4,8 +4,20 @@
 void init_mysql2_result(void);
 VALUE rb_mysql_result_to_obj(VALUE client, VALUE encoding, VALUE options, MYSQL_RES *r, VALUE statement);
 
+/* Scalar field metadata captured while the MYSQL_RES is alive, so that
+ * field_types (and friends) keep working after the result set is freed. */
+typedef struct {
+  unsigned long length;
+  unsigned int charsetnr;
+  unsigned int decimals;
+  unsigned int flags;
+  int type; /* enum enum_field_types */
+  char is_json; /* MariaDB extended metadata, only resolvable while alive */
+} mysql2_field_meta;
+
 typedef struct {
   VALUE fields;
+  VALUE fieldSymbols;
   VALUE fieldTypes;
   VALUE rows;
   VALUE client;
@@ -18,6 +30,7 @@ typedef struct {
   char streamingComplete;
   char resultFreed;
   MYSQL_RES *result;
+  mysql2_field_meta *field_meta;
   mysql_stmt_wrapper *stmt_wrapper;
   mysql_client_wrapper *client_wrapper;
   /* statement result bind buffers */

@@ -70,6 +70,8 @@ static void rb_mysql_result_mark(void * wrapper) {
   mysql2_result_wrapper * w = wrapper;
   if (w) {
     rb_gc_mark_movable(w->fields);
+    rb_gc_mark_movable(w->fieldSymbols);
+    rb_gc_mark_movable(w->fieldTypes);
     rb_gc_mark_movable(w->rows);
     rb_gc_mark_movable(w->encoding);
     rb_gc_mark_movable(w->client);
@@ -127,6 +129,11 @@ static void rb_mysql_result_free(void *ptr) {
   mysql2_result_wrapper *wrapper = ptr;
   rb_mysql_result_free_result(wrapper);
 
+  if (wrapper->field_meta) {
+    xfree(wrapper->field_meta);
+    wrapper->field_meta = NULL;
+  }
+
   // If the GC gets to client first it will be nil
   if (wrapper->client != Qnil) {
     decr_mysql2_client(wrapper->client_wrapper);
@@ -138,6 +145,9 @@ static void rb_mysql_result_free(void *ptr) {
 static size_t rb_mysql_result_memsize(const void * wrapper) {
   const mysql2_result_wrapper * w = wrapper;
   size_t memsize = sizeof(*w);
+  if (w->field_meta) {
+    memsize += sizeof(mysql2_field_meta) * w->numberOfFields;
+  }
   if (w->stmt_wrapper) {
     memsize += sizeof(*w->stmt_wrapper);
   }
@@ -152,6 +162,8 @@ static void rb_mysql_result_compact(void * wrapper) {
   mysql2_result_wrapper * w = wrapper;
   if (w) {
     rb_mysql2_gc_location(w->fields);
+    rb_mysql2_gc_location(w->fieldSymbols);
+    rb_mysql2_gc_location(w->fieldTypes);
     rb_mysql2_gc_location(w->rows);
     rb_mysql2_gc_location(w->encoding);
     rb_mysql2_gc_location(w->client);
@@ -201,21 +213,63 @@ static void *nogvl_stmt_fetch(void *ptr) {
   return (void *)r;
 }
 
-static VALUE rb_mysql_result_fetch_field(VALUE self, unsigned int idx, int symbolize_keys) {
-  VALUE rb_field;
-  GET_RESULT(self);
+static int rb_mariadb_json_type(const MYSQL_FIELD *field);
 
-  if (wrapper->fields == Qnil) {
+/* Capture scalar per-field metadata while the C result set is still alive so
+ * metadata accessors keep working after rb_mysql_result_free_result. */
+static void rb_mysql_result_capture_field_meta(mysql2_result_wrapper *wrapper) {
+  unsigned int i;
+
+  if (wrapper->field_meta != NULL || wrapper->result == NULL || wrapper->resultFreed) return;
+
+  if (wrapper->numberOfFields == 0) {
     wrapper->numberOfFields = mysql_num_fields(wrapper->result);
-    wrapper->fields = rb_ary_new2(wrapper->numberOfFields);
   }
 
-  rb_field = rb_ary_entry(wrapper->fields, idx);
+  wrapper->field_meta = xcalloc(wrapper->numberOfFields, sizeof(mysql2_field_meta));
+  for (i = 0; i < wrapper->numberOfFields; i++) {
+    const MYSQL_FIELD *field = mysql_fetch_field_direct(wrapper->result, i);
+    mysql2_field_meta *meta = &wrapper->field_meta[i];
+    meta->length    = field->length;
+    meta->charsetnr = field->charsetnr;
+    meta->decimals  = field->decimals;
+    meta->flags     = field->flags;
+    meta->type      = field->type;
+    meta->is_json   = (char)rb_mariadb_json_type(field);
+  }
+}
+
+static VALUE rb_mysql_result_fetch_field(VALUE self, unsigned int idx, int symbolize_keys) {
+  VALUE rb_field;
+  VALUE *field_ary;
+  GET_RESULT(self);
+
+  /* Field names are cached per representation so that the :symbolize_keys
+   * option given to #each is honored even when the eager fetch at result
+   * creation time ran with the query-level options. */
+  if (wrapper->fields == Qnil) {
+    if (wrapper->numberOfFields == 0) {
+      if (wrapper->resultFreed) {
+        rb_raise(cMysql2Error, "Result set has already been freed");
+      }
+      wrapper->numberOfFields = mysql_num_fields(wrapper->result);
+    }
+    wrapper->fields = rb_ary_new2(wrapper->numberOfFields);
+  }
+  if (symbolize_keys && wrapper->fieldSymbols == Qnil) {
+    wrapper->fieldSymbols = rb_ary_new2(wrapper->numberOfFields);
+  }
+  field_ary = symbolize_keys ? &wrapper->fieldSymbols : &wrapper->fields;
+
+  rb_field = rb_ary_entry(*field_ary, idx);
   if (rb_field == Qnil) {
     MYSQL_FIELD *field = NULL;
     rb_encoding *default_internal_enc = rb_default_internal_encoding();
     rb_encoding *conn_enc = rb_to_encoding(wrapper->encoding);
 
+    if (wrapper->resultFreed) {
+      rb_raise(cMysql2Error, "Result set has already been freed");
+    }
     field = mysql_fetch_field_direct(wrapper->result, idx);
     if (symbolize_keys) {
       rb_field = rb_intern3(field->name, field->name_length, rb_utf8_encoding());
@@ -234,7 +288,7 @@ static VALUE rb_mysql_result_fetch_field(VALUE self, unsigned int idx, int symbo
       rb_obj_freeze(rb_field);
 #endif
     }
-    rb_ary_store(wrapper->fields, idx, rb_field);
+    rb_ary_store(*field_ary, idx, rb_field);
   }
 
   return rb_field;
@@ -256,19 +310,23 @@ static VALUE rb_mysql_result_fetch_field_type(VALUE self, unsigned int idx) {
   VALUE rb_field_type;
   GET_RESULT(self);
 
+  /* Types are built from the captured metadata snapshot, so they stay
+   * available after the underlying result set has been freed. */
+  rb_mysql_result_capture_field_meta(wrapper);
+  if (wrapper->field_meta == NULL) {
+    rb_raise(cMysql2Error, "Result set has already been freed");
+  }
+
   if (wrapper->fieldTypes == Qnil) {
-    wrapper->numberOfFields = mysql_num_fields(wrapper->result);
     wrapper->fieldTypes = rb_ary_new2(wrapper->numberOfFields);
   }
 
   rb_field_type = rb_ary_entry(wrapper->fieldTypes, idx);
   if (rb_field_type == Qnil) {
-    MYSQL_FIELD *field = NULL;
+    const mysql2_field_meta *field = &wrapper->field_meta[idx];
     rb_encoding *default_internal_enc = rb_default_internal_encoding();
     rb_encoding *conn_enc = rb_to_encoding(wrapper->encoding);
     int precision;
-
-    field = mysql_fetch_field_direct(wrapper->result, idx);
 
     switch(field->type) {
       case MYSQL_TYPE_NULL:         // NULL
@@ -317,11 +375,11 @@ static VALUE rb_mysql_result_fetch_field_type(VALUE self, unsigned int idx) {
           Handle precision similar to this line from mysql's code:
           https://github.com/mysql/mysql-server/blob/ea7d2e2d16ac03afdd9cb72a972a95981107bf51/sql/field.cc#L2246
         */
-        precision = field->length - (field->decimals > 0 ? 2 : 1);
+        precision = (int)(field->length - (field->decimals > 0 ? 2 : 1));
         rb_field_type = rb_sprintf("decimal(%d,%d)", precision, field->decimals);
         break;
       case MYSQL_TYPE_STRING:       // char[]
-        if (rb_mariadb_json_type(field)) {
+        if (field->is_json) {
           rb_field_type = rb_str_new_cstr("json");
         } else if (field->flags & ENUM_FLAG) {
           rb_field_type = rb_str_new_cstr("enum");
@@ -338,14 +396,14 @@ static VALUE rb_mysql_result_fetch_field_type(VALUE self, unsigned int idx) {
       case MYSQL_TYPE_VAR_STRING:   // char[]
         if (field->charsetnr == MYSQL2_BINARY_CHARSET) {
           rb_field_type = rb_sprintf("varbinary(%ld)", field->length);
-        } else if (rb_mariadb_json_type(field)) {
+        } else if (field->is_json) {
           rb_field_type = rb_str_new_cstr("json");
         } else {
           rb_field_type = rb_sprintf("varchar(%ld)", field->length / MYSQL2_MAX_BYTES_PER_CHAR);
         }
         break;
       case MYSQL_TYPE_VARCHAR:      // char[]
-        if (rb_mariadb_json_type(field)) {
+        if (field->is_json) {
           rb_field_type = rb_str_new_cstr("json");
           break;
         }
@@ -355,7 +413,7 @@ static VALUE rb_mysql_result_fetch_field_type(VALUE self, unsigned int idx) {
         rb_field_type = rb_str_new_cstr("tinyblob");
         break;
       case MYSQL_TYPE_BLOB:         // char[]
-        if (rb_mariadb_json_type(field)) {
+        if (field->is_json) {
           rb_field_type = rb_str_new_cstr("json");
           break;
         }
@@ -659,7 +717,15 @@ static VALUE rb_mysql_result_fetch_row_stmt(VALUE self, MYSQL_FIELD * fields, co
         case MYSQL_TYPE_DATE:         // MYSQL_TIME
         case MYSQL_TYPE_NEWDATE:      // MYSQL_TIME
           ts = (MYSQL_TIME*)result_buffer->buffer;
-          val = rb_funcall(cDate, intern_new, 3, INT2NUM(ts->year), INT2NUM(ts->month), INT2NUM(ts->day));
+          /* Mirror the text-protocol semantics for zero and partial-zero dates. */
+          if (ts->year + ts->month + ts->day == 0) {
+            val = Qnil;
+          } else if (ts->month < 1 || ts->day < 1) {
+            rb_raise(cMysql2Error, "Invalid date in field '%.*s': %04u-%02u-%02u",
+                     fields[i].name_length, fields[i].name, ts->year, ts->month, ts->day);
+          } else {
+            val = rb_funcall(cDate, intern_new, 3, INT2NUM(ts->year), INT2NUM(ts->month), INT2NUM(ts->day));
+          }
           break;
         case MYSQL_TYPE_TIME:         // MYSQL_TIME
           ts = (MYSQL_TIME*)result_buffer->buffer;
@@ -678,6 +744,15 @@ static VALUE rb_mysql_result_fetch_row_stmt(VALUE self, MYSQL_FIELD * fields, co
 
           ts = (MYSQL_TIME*)result_buffer->buffer;
           seconds = (ts->year*31557600ULL) + (ts->month*2592000ULL) + (ts->day*86400ULL) + (ts->hour*3600ULL) + (ts->minute*60ULL) + ts->second;
+
+          /* Mirror the text-protocol semantics for zero and partial-zero datetimes. */
+          if (seconds == 0) {
+            val = Qnil;
+            break;
+          } else if (ts->month < 1 || ts->day < 1) {
+            rb_raise(cMysql2Error, "Invalid date in field '%.*s': %04u-%02u-%02u %02u:%02u:%02u",
+                     fields[i].name_length, fields[i].name, ts->year, ts->month, ts->day, ts->hour, ts->minute, ts->second);
+          }
 
           if (seconds < MYSQL2_MIN_TIME || seconds > MYSQL2_MAX_TIME) { // use DateTime instead
             VALUE offset = INT2NUM(0);
@@ -952,7 +1027,7 @@ static VALUE rb_mysql_result_fetch_row(VALUE self, MYSQL_FIELD * fields, const r
 static VALUE rb_mysql_result_fetch_fields(VALUE self) {
   unsigned int i = 0;
   short int symbolizeKeys = 0;
-  VALUE defaults;
+  VALUE defaults, field_ary;
 
   GET_RESULT(self);
 
@@ -962,21 +1037,18 @@ static VALUE rb_mysql_result_fetch_fields(VALUE self) {
     symbolizeKeys = 1;
   }
 
-  if (wrapper->fields == Qnil) {
-    if (wrapper->resultFreed) {
+  field_ary = symbolizeKeys ? wrapper->fieldSymbols : wrapper->fields;
+  if (field_ary == Qnil || (my_ulonglong)RARRAY_LEN(field_ary) != wrapper->numberOfFields) {
+    if (field_ary == Qnil && wrapper->resultFreed) {
       rb_raise(cMysql2Error, "Result set has already been freed");
     }
-    wrapper->numberOfFields = mysql_num_fields(wrapper->result);
-    wrapper->fields = rb_ary_new2(wrapper->numberOfFields);
-  }
-
-  if ((my_ulonglong)RARRAY_LEN(wrapper->fields) != wrapper->numberOfFields) {
     for (i=0; i<wrapper->numberOfFields; i++) {
       rb_mysql_result_fetch_field(self, i, symbolizeKeys);
     }
+    field_ary = symbolizeKeys ? wrapper->fieldSymbols : wrapper->fields;
   }
 
-  return wrapper->fields;
+  return field_ary;
 }
 
 static VALUE rb_mysql_result_fetch_field_types(VALUE self) {
@@ -984,11 +1056,15 @@ static VALUE rb_mysql_result_fetch_field_types(VALUE self) {
 
   GET_RESULT(self);
 
+  /* The metadata snapshot outlives the C result set, so this works on freed
+   * results as long as the result was alive at some point in this object's
+   * lifetime (which rb_mysql_result_to_obj guarantees for regular queries). */
+  rb_mysql_result_capture_field_meta(wrapper);
+  if (wrapper->field_meta == NULL) {
+    rb_raise(cMysql2Error, "Result set has already been freed");
+  }
+
   if (wrapper->fieldTypes == Qnil) {
-    if (wrapper->resultFreed) {
-      rb_raise(cMysql2Error, "Result set has already been freed");
-    }
-    wrapper->numberOfFields = mysql_num_fields(wrapper->result);
     wrapper->fieldTypes = rb_ary_new2(wrapper->numberOfFields);
   }
 
@@ -1010,6 +1086,8 @@ static VALUE rb_mysql_result_each_(VALUE self,
   MYSQL_FIELD *fields = NULL;
 
   GET_RESULT(self);
+
+  rb_mysql_result_capture_field_meta(wrapper);
 
   if (wrapper->is_streaming) {
     /* When streaming, we will only yield rows, not return them. */
@@ -1223,7 +1301,9 @@ VALUE rb_mysql_result_to_obj(VALUE client, VALUE encoding, VALUE options, MYSQL_
   wrapper->resultFreed = 0;
   wrapper->result = r;
   wrapper->fields = Qnil;
+  wrapper->fieldSymbols = Qnil;
   wrapper->fieldTypes = Qnil;
+  wrapper->field_meta = NULL;
   wrapper->rows = Qnil;
   wrapper->encoding = encoding;
   wrapper->streamingComplete = 0;
@@ -1256,6 +1336,7 @@ VALUE rb_mysql_result_to_obj(VALUE client, VALUE encoding, VALUE options, MYSQL_
    * after iteration completes but before .fields is accessed.
    * See: https://github.com/brianmario/mysql2/issues/1426 */
   if (r != NULL && !wrapper->is_streaming) {
+    rb_mysql_result_capture_field_meta(wrapper);
     rb_mysql_result_fetch_fields(obj);
   }
 

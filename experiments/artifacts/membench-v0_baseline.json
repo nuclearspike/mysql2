@@ -1,0 +1,8 @@
+{
+  "variant": "v0_baseline",
+  "ts": "2026-07-28T06:58:43Z",
+  "rows_array_memsize_bytes": 16384040,
+  "rss_base_kb": 26592,
+  "rss_peak_kb": 193696,
+  "rss_after_free_kb": 193696
+}
