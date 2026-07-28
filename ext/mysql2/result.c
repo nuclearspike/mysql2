@@ -60,7 +60,9 @@ typedef struct {
    * field_meta is captured at most once per result and freed only when the
    * wrapper itself is GC'd, which the caller's stack reference prevents. */
   mysql2_field_meta *field_meta;
-  rb_encoding *default_internal_enc;
+  /* conn_enc is immutable per result; Encoding.default_internal is NOT
+   * hoisted here because user code may change it between yielded rows and
+   * the historical behavior resolves it per row. */
   rb_encoding *conn_enc;
 } result_each_args;
 
@@ -536,6 +538,7 @@ static VALUE mysql2_set_field_string_encoding(VALUE val, mysql2_field_meta *meta
 
 #ifdef HAVE_RB_TIME_TIMESPEC_NEW
 #include <limits.h>
+#include <time.h>
 
 /* days_from_civil (Howard Hinnant's public-domain algorithm): proleptic
  * Gregorian civil date -> days since 1970-01-01. */
@@ -568,6 +571,7 @@ static VALUE mysql2_utc_time(unsigned int year, unsigned int month, unsigned int
                        + hour * 3600 + min * 60 + sec;
   const time_t narrowed = (time_t)secs;
   if ((int64_t)narrowed != secs) return Qnil;
+  if (usec >= 1000000UL) return Qnil; /* corrupt subseconds: let Time.utc raise */
   ts.tv_sec = narrowed;
   ts.tv_nsec = (long)(usec * 1000UL);
   return rb_time_timespec_new(&ts, INT_MAX - 1);
@@ -698,9 +702,15 @@ static VALUE rb_mysql_result_fetch_row_stmt(VALUE self, MYSQL_FIELD * fields, co
   VALUE rowVal;
   unsigned int i = 0;
 
-  rb_encoding *default_internal_enc = args->default_internal_enc;
+  rb_encoding *default_internal_enc = rb_default_internal_encoding();
   rb_encoding *conn_enc = args->conn_enc;
   GET_RESULT(self);
+
+  /* The result can be freed from inside the iteration block; end the
+   * iteration instead of touching freed statement buffers. */
+  if (wrapper->resultFreed) {
+    return Qnil;
+  }
 
   if (args->asArray) {
     rowVal = rb_ary_new2(wrapper->numberOfFields);
@@ -806,7 +816,7 @@ static VALUE rb_mysql_result_fetch_row_stmt(VALUE self, MYSQL_FIELD * fields, co
             val = Qnil;
           } else if (ts->month < 1 || ts->day < 1) {
             rb_raise(cMysql2Error, "Invalid date in field '%.*s': %04u-%02u-%02u",
-                     fields[i].name_length, fields[i].name, ts->year, ts->month, ts->day);
+                     (int)fields[i].name_length, fields[i].name, ts->year, ts->month, ts->day);
           } else {
             val = rb_funcall(cDate, intern_new, 3, INT2NUM(ts->year), INT2NUM(ts->month), INT2NUM(ts->day));
           }
@@ -847,7 +857,7 @@ static VALUE rb_mysql_result_fetch_row_stmt(VALUE self, MYSQL_FIELD * fields, co
             break;
           } else if (ts->month < 1 || ts->day < 1) {
             rb_raise(cMysql2Error, "Invalid date in field '%.*s': %04u-%02u-%02u %02u:%02u:%02u",
-                     fields[i].name_length, fields[i].name, ts->year, ts->month, ts->day, ts->hour, ts->minute, ts->second);
+                     (int)fields[i].name_length, fields[i].name, ts->year, ts->month, ts->day, ts->hour, ts->minute, ts->second);
           }
 
           if (seconds < MYSQL2_MIN_TIME || seconds > MYSQL2_MAX_TIME) { // use DateTime instead
@@ -866,7 +876,10 @@ static VALUE rb_mysql_result_fetch_row_stmt(VALUE self, MYSQL_FIELD * fields, co
             }
           } else {
 #ifdef HAVE_RB_TIME_TIMESPEC_NEW
-            if (MYSQL2_UTC_FAST_PATH_OK(args->db_timezone, ts->hour, ts->minute, ts->second)) {
+            /* month/day lower bounds were validated above; the upper bounds
+             * keep silently-wrong epochs impossible for corrupt input (the
+             * funcall path raises instead). */
+            if (MYSQL2_UTC_FAST_PATH_OK(args->db_timezone, ts->hour, ts->minute, ts->second) && ts->month <= 12 && ts->day <= 31) {
               val = mysql2_utc_time(ts->year, ts->month, ts->day, ts->hour, ts->minute, ts->second, ts->second_part);
             }
             if (!NIL_P(val)) {
@@ -927,9 +940,15 @@ static VALUE rb_mysql_result_fetch_row(VALUE self, MYSQL_FIELD * fields, const r
   unsigned int i = 0;
   unsigned long * fieldLengths;
   void * ptr;
-  rb_encoding *default_internal_enc = args->default_internal_enc;
+  rb_encoding *default_internal_enc = rb_default_internal_encoding();
   rb_encoding *conn_enc = args->conn_enc;
   GET_RESULT(self);
+
+  /* The result can be freed from inside the iteration block; end the
+   * iteration instead of dereferencing the freed MYSQL_RES. */
+  if (wrapper->resultFreed) {
+    return Qnil;
+  }
 
   ptr = wrapper->result;
   row = (MYSQL_ROW)rb_thread_call_without_gvl(nogvl_fetch_row, ptr, RUBY_UBF_IO, 0);
@@ -1087,7 +1106,10 @@ static VALUE rb_mysql_result_fetch_row(VALUE self, MYSQL_FIELD * fields, const r
               } else {
                 msec = msec_char_to_uint(msec_char, sizeof(msec_char));
 #ifdef HAVE_RB_TIME_TIMESPEC_NEW
-                if (MYSQL2_UTC_FAST_PATH_OK(args->db_timezone, hour, min, sec)) {
+                /* month/day lower bounds were validated above; the upper bounds
+                 * keep silently-wrong epochs impossible for corrupt input (the
+                 * funcall path raises instead). */
+                if (MYSQL2_UTC_FAST_PATH_OK(args->db_timezone, hour, min, sec) && month <= 12 && day <= 31) {
                   val = mysql2_utc_time(year, month, day, hour, min, sec, msec);
                 }
                 if (!NIL_P(val)) {
@@ -1176,6 +1198,15 @@ static VALUE rb_mysql_result_fetch_fields(VALUE self) {
   Check_Type(defaults, T_HASH);
   if (rb_hash_aref(defaults, sym_symbolize_keys) == Qtrue) {
     symbolizeKeys = 1;
+  }
+
+  /* Streaming results skip the eager fetch at creation, so the field count
+   * may still be unknown here. */
+  if (wrapper->numberOfFields == 0) {
+    if (wrapper->resultFreed) {
+      rb_raise(cMysql2Error, "Result set has already been freed");
+    }
+    wrapper->numberOfFields = mysql_num_fields(wrapper->result);
   }
 
   field_ary = symbolizeKeys ? wrapper->fieldSymbols : wrapper->fields;
@@ -1353,11 +1384,18 @@ static VALUE rb_mysql_result_each(int argc, VALUE * argv, VALUE self) {
     rb_warn(":cast is forced for prepared statements");
   }
 
-  /* A freed result can only be re-iterated from the fully cached rows array;
-   * anything else would dereference the freed MYSQL_RES. */
-  if (wrapper->resultFreed && !wrapper->is_streaming &&
-      !(cacheRows && wrapper->rows != Qnil && wrapper->lastRowProcessed == wrapper->numberOfRows)) {
-    rb_raise(cMysql2Error, "Result set has already been freed");
+  /* A freed result can only be re-iterated from the fully cached rows array
+   * (or raise the streaming-specific error below when a completed stream is
+   * re-iterated); anything else would dereference the freed MYSQL_RES. The
+   * rows-length check matters: cache_rows: false leaves the array empty even
+   * after a full iteration, and replaying it would yield nil rows. */
+  if (wrapper->resultFreed) {
+    int replayable = cacheRows && wrapper->rows != Qnil &&
+                     wrapper->lastRowProcessed == wrapper->numberOfRows &&
+                     (my_ulonglong)RARRAY_LEN(wrapper->rows) == wrapper->numberOfRows;
+    if (wrapper->is_streaming ? !wrapper->streamingComplete : !replayable) {
+      rb_raise(cMysql2Error, "Result set has already been freed");
+    }
   }
 
   dbTz = rb_hash_aref(opts, sym_database_timezone);
@@ -1408,11 +1446,13 @@ static VALUE rb_mysql_result_each(int argc, VALUE * argv, VALUE self) {
 
   /* Resolve per-call hot-path state once, instead of per row or per cell.
    * The local VALUE keeps the fields array pinned via conservative stack
-   * marking for the duration of the iteration. */
+   * marking for the duration of the iteration. Field names are materialized
+   * for as: :array too, matching the historical side effect that #fields
+   * stays available after (even streaming) iteration. */
   args.fields_ary = Qnil;
-  if (!asArray && !(wrapper->resultFreed && cacheRows)) {
+  if (!wrapper->resultFreed) {
     unsigned int fi;
-    if (wrapper->numberOfFields == 0 && !wrapper->resultFreed) {
+    if (wrapper->numberOfFields == 0) {
       wrapper->numberOfFields = mysql_num_fields(wrapper->result);
     }
     for (fi = 0; fi < wrapper->numberOfFields; fi++) {
@@ -1420,10 +1460,14 @@ static VALUE rb_mysql_result_each(int argc, VALUE * argv, VALUE self) {
     }
     args.fields_ary = symbolizeKeys ? wrapper->fieldSymbols : wrapper->fields;
   }
-  args.default_internal_enc = rb_default_internal_encoding();
   args.conn_enc = rb_to_encoding(wrapper->encoding);
   rb_mysql_result_capture_field_meta(wrapper);
   args.field_meta = wrapper->field_meta;
+  /* Fail fast rather than fetch rows without column metadata; unreachable
+   * today because a live result always captures successfully. */
+  if (!wrapper->resultFreed && wrapper->numberOfFields > 0 && args.field_meta == NULL) {
+    rb_raise(cMysql2Error, "Result set has already been freed");
+  }
 
   if (wrapper->stmt_wrapper) {
     fetch_row_func = rb_mysql_result_fetch_row_stmt;

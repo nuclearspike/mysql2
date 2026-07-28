@@ -494,6 +494,7 @@ RSpec.describe Mysql2::Statement do # rubocop:disable Metrics/BlockLength
       end
 
       it "returns nil for zero dates over the binary protocol, matching the text protocol" do
+        @client.query("UPDATE mysql2_zero_dates SET ts_test = '0000-00-00 00:00:00'")
         text_row = @client.query("SELECT * FROM mysql2_zero_dates").first
         stmt_row = @client.prepare("SELECT * FROM mysql2_zero_dates").execute.first
         expect(text_row).to eql("d" => nil, "dt" => nil, "ts_test" => nil)
@@ -506,6 +507,14 @@ RSpec.describe Mysql2::Statement do # rubocop:disable Metrics/BlockLength
           raise_error(Mysql2::Error, /Invalid date in field 'dt'/)
         expect { @client.prepare("SELECT dt FROM mysql2_zero_dates").execute.to_a }.to \
           raise_error(Mysql2::Error, /Invalid date in field 'dt'/)
+      end
+
+      it "raises Mysql2::Error for partial-zero DATE values over both protocols" do
+        @client.query("UPDATE mysql2_zero_dates SET d = '1972-00-27'")
+        expect { @client.query("SELECT d FROM mysql2_zero_dates").to_a }.to \
+          raise_error(Mysql2::Error, /Invalid date in field 'd'/)
+        expect { @client.prepare("SELECT d FROM mysql2_zero_dates").execute.to_a }.to \
+          raise_error(Mysql2::Error, /Invalid date in field 'd'/)
       end
     end
 
