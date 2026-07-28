@@ -13,6 +13,11 @@ typedef struct {
   unsigned int flags;
   int type; /* enum enum_field_types */
   char is_json; /* MariaDB extended metadata, only resolvable while alive */
+  /* Column encoding resolution, computed once per column instead of per cell.
+   * 0 = unresolved, 1 = binary (no default_internal export), 2 = by index
+   * (enc_index valid), 3 = connection encoding fallback. */
+  char enc_state;
+  int enc_index;
 } mysql2_field_meta;
 
 typedef struct {

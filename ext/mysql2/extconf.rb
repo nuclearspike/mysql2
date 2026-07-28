@@ -43,6 +43,12 @@ have_func('rb_wait_for_single_fd')
 # 3.0+
 have_func('rb_enc_interned_str', 'ruby.h')
 
+# 3.3.11+ (present since 1.9.3; guarded for safety)
+have_func('rb_time_timespec_new', 'ruby.h')
+
+# 3.2+
+have_func('rb_hash_new_capa', 'ruby.h')
+
 ### Find OpenSSL library
 
 # User-specified OpenSSL if explicitly specified

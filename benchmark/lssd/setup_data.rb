@@ -1,5 +1,6 @@
 # Deterministic benchmark data generator — reference_set.mysql2.bench_tables 1.0.0
 # Idempotent: skips tables whose row counts already match. Seed pinned to 42.
+# rubocop:disable Naming/MethodParameterName, Layout/LineLength
 $LOAD_PATH.unshift File.expand_path('../../lib', __dir__)
 require 'mysql2'
 require 'yaml'
@@ -10,16 +11,18 @@ client.query 'CREATE DATABASE IF NOT EXISTS mysql2_bench'
 client.query 'USE mysql2_bench'
 
 DDL = {
-  't_ints' => "CREATE TABLE t_ints (id BIGINT NOT NULL PRIMARY KEY, #{(1..10).map { |i| "c#{i} INT NOT NULL" }.join(', ')})",
-  't_strings' => "CREATE TABLE t_strings (id BIGINT NOT NULL PRIMARY KEY, #{(1..10).map { |i| "s#{i} VARCHAR(64) NOT NULL" }.join(', ')}) CHARACTER SET utf8mb4",
+  't_ints'      => "CREATE TABLE t_ints (id BIGINT NOT NULL PRIMARY KEY, #{(1..10).map { |i| "c#{i} INT NOT NULL" }.join(', ')})",
+  't_strings'   => "CREATE TABLE t_strings (id BIGINT NOT NULL PRIMARY KEY, #{(1..10).map { |i| "s#{i} VARCHAR(64) NOT NULL" }.join(', ')}) CHARACTER SET utf8mb4",
   't_datetimes' => "CREATE TABLE t_datetimes (id BIGINT NOT NULL PRIMARY KEY, #{(1..6).map { |i| "d#{i} DATETIME(6) NOT NULL" }.join(', ')})",
-  't_mixed' => 'CREATE TABLE t_mixed (id BIGINT NOT NULL PRIMARY KEY, name VARCHAR(64) NOT NULL, email VARCHAR(64) NOT NULL, city VARCHAR(64) NOT NULL, status VARCHAR(16) NOT NULL, age INT NOT NULL, score INT NOT NULL, created_at DATETIME(6) NOT NULL, updated_at DATETIME(6) NOT NULL, flag TINYINT(1) NOT NULL, amount DECIMAL(10,2) NOT NULL, body VARCHAR(255) NOT NULL) CHARACTER SET utf8mb4',
-  't_wide' => "CREATE TABLE t_wide (id BIGINT NOT NULL PRIMARY KEY, #{(1..13).map { |i| "i#{i} INT NOT NULL" }.join(', ')}, #{(1..13).map { |i| "v#{i} VARCHAR(32) NOT NULL" }.join(', ')}, #{(1..13).map { |i| "t#{i} DATETIME NOT NULL" }.join(', ')}) CHARACTER SET utf8mb4",
-  't_big' => 'CREATE TABLE t_big (id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY, a INT NOT NULL, b VARCHAR(32) NOT NULL)',
+  't_mixed'     => 'CREATE TABLE t_mixed (id BIGINT NOT NULL PRIMARY KEY, name VARCHAR(64) NOT NULL, email VARCHAR(64) NOT NULL, city VARCHAR(64) NOT NULL, status VARCHAR(16) NOT NULL, age INT NOT NULL, score INT NOT NULL, created_at DATETIME(6) NOT NULL, updated_at DATETIME(6) NOT NULL, flag TINYINT(1) NOT NULL, amount DECIMAL(10,2) NOT NULL, body VARCHAR(255) NOT NULL) CHARACTER SET utf8mb4',
+  't_wide'      => "CREATE TABLE t_wide (id BIGINT NOT NULL PRIMARY KEY, #{(1..13).map { |i| "i#{i} INT NOT NULL" }.join(', ')}, #{(1..13).map { |i| "v#{i} VARCHAR(32) NOT NULL" }.join(', ')}, #{(1..13).map do |i|
+    "t#{i} DATETIME NOT NULL"
+  end.join(', ')}) CHARACTER SET utf8mb4",
+  't_big'       => 'CREATE TABLE t_big (id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY, a INT NOT NULL, b VARCHAR(32) NOT NULL)',
 }.freeze
 
 EXPECTED_ROWS = { 't_ints' => 50_000, 't_strings' => 50_000, 't_datetimes' => 50_000,
-                  't_mixed' => 50_000, 't_wide' => 5_000, 't_big' => 2_048_000 }.freeze
+                  't_mixed' => 50_000, 't_wide' => 5_000, 't_big' => 2_048_000, }.freeze
 
 def row_count(client, table)
   client.query("SELECT COUNT(*) AS c FROM #{table}").first['c']
@@ -66,7 +69,12 @@ DDL.each do |table, ddl|
     insert_batches(client, table, 50_000) { |rng, id| "(#{id},#{Array.new(6) { "'#{dt(rng)}'" }.join(',')})" }
   when 't_mixed'
     insert_batches(client, table, 50_000) do |rng, id|
-      "(#{id},'#{word(rng, 2)}','u#{rng.rand(10**9)}@example.com','#{WORDS[rng.rand(16)]}','#{%w[active idle gone][rng.rand(3)]}',#{rng.rand(90)},#{rng.rand(10_000)},'#{dt(rng)}','#{dt(rng)}',#{rng.rand(2)},#{format('%.2f', rng.rand * 99_999)},'#{word(rng, 8)}')"
+      "(#{id},'#{word(rng,
+                      2,)}','u#{rng.rand(10**9)}@example.com','#{WORDS[rng.rand(16)]}','#{%w[active idle
+                                                                                             gone][rng.rand(3)]}',#{rng.rand(90)},#{rng.rand(10_000)},'#{dt(rng)}','#{dt(rng)}',#{rng.rand(2)},#{format('%.2f',
+                                                                                                                                                                                                        rng.rand * 99_999,)},'#{word(
+                                                                                                                                                                                                          rng, 8,
+                                                                                                                                                                                                        )}')"
     end
   when 't_wide'
     insert_batches(client, table, 5_000) do |rng, id|
@@ -84,3 +92,5 @@ DDL.each_key do |t|
   r = client.query("CHECKSUM TABLE #{t}").first
   puts "#{t}: rows=#{row_count(client, t)} checksum=#{r['Checksum']}"
 end
+
+# rubocop:enable Naming/MethodParameterName, Layout/LineLength

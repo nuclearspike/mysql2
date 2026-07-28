@@ -1,6 +1,6 @@
 require 'spec_helper'
 
-RSpec.describe Mysql2::Result do
+RSpec.describe Mysql2::Result do # rubocop:disable Metrics/BlockLength
   before(:example) do
     @result = @client.query "SELECT 1"
   end
@@ -20,6 +20,36 @@ RSpec.describe Mysql2::Result do
 
   it "should respond to #free" do
     expect(@result).to respond_to(:free)
+  end
+
+  it "should cast DATETIME(6) values identically for :utc and via prepared statements" do
+    # Guards the C fast path for :utc Time construction against the generic
+    # Time.utc path across range and microsecond edges.
+    values = ['0000-01-01 00:00:00.000000', '1000-01-01 23:59:59.999999',
+              '1969-12-31 23:59:59.123456', '1970-01-01 00:00:00.000001',
+              '2026-07-28 12:34:56.654321', '9999-12-31 11:59:59.500000',]
+    values.each do |v|
+      expected = Time.utc(*v.split(/[- :.]/).map(&:to_i)[0, 6]) + Rational(v.split('.').last.to_i, 1_000_000)
+      text = @client.query("SELECT CAST('#{v}' AS DATETIME(6)) AS t", database_timezone: :utc).first['t']
+      stmt = @client.prepare("SELECT CAST('#{v}' AS DATETIME(6)) AS t").execute(database_timezone: :utc).first['t']
+      expect(text).to eql(expected), "text cast mismatch for #{v}: got #{text.inspect}"
+      expect(stmt).to eql(expected), "stmt cast mismatch for #{v}: got #{stmt.inspect}"
+      expect(text.utc_offset).to eql(0)
+      expect(text.usec).to eql(v.split('.').last.to_i)
+    end
+  end
+
+  it "should raise when iterating a result freed before being fully cached" do
+    result = @client.query "SELECT 1"
+    result.free
+    expect { result.each.to_a }.to raise_error(Mysql2::Error, "Result set has already been freed")
+  end
+
+  it "should still replay cached rows after the result is freed" do
+    result = @client.query "SELECT 1 AS a UNION SELECT 2"
+    rows = result.to_a # fully cached; C result auto-freed here
+    result.free
+    expect(result.to_a).to eql(rows)
   end
 
   it "should raise a Mysql2::Error exception upon a bad query" do

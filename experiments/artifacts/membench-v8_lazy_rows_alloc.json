@@ -1,0 +1,8 @@
+{
+  "variant": "v8_lazy_rows_alloc",
+  "ts": "2026-07-28T07:37:04Z",
+  "rows_array_memsize_bytes": 40,
+  "rss_base_kb": 26832,
+  "rss_peak_kb": 194048,
+  "rss_after_free_kb": 194048
+}

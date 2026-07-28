@@ -53,6 +53,15 @@ typedef struct {
   ID db_timezone;
   ID app_timezone;
   int block_given; /* boolean */
+  /* Hot-path state resolved once per #each call instead of once per row/cell.
+   * fields_ary is pinned by the caller's C stack reference for GC safety. */
+  VALUE fields_ary;
+  /* Borrowed pointer into the wrapper. Stable for the whole iteration:
+   * field_meta is captured at most once per result and freed only when the
+   * wrapper itself is GC'd, which the caller's stack reference prevents. */
+  mysql2_field_meta *field_meta;
+  rb_encoding *default_internal_enc;
+  rb_encoding *conn_enc;
 } result_each_args;
 
 extern VALUE mMysql2, cMysql2Client, cMysql2Error;
@@ -487,34 +496,103 @@ static VALUE rb_mysql_result_fetch_field_type(VALUE self, unsigned int idx) {
   return rb_field_type;
 }
 
-static VALUE mysql2_set_field_string_encoding(VALUE val, MYSQL_FIELD field, rb_encoding *default_internal_enc, rb_encoding *conn_enc) {
-  /* if binary flag is set, respect its wishes */
-  if (field.flags & BINARY_FLAG && field.charsetnr == MYSQL2_BINARY_CHARSET) {
-    rb_enc_associate(val, binaryEncoding);
-  } else if (!field.charsetnr) {
-    /* MySQL 4.x may not provide an encoding, binary will get the bytes through */
-    rb_enc_associate(val, binaryEncoding);
-  } else {
-    /* lookup the encoding configured on this field */
-    const char *enc_name;
-    int enc_index;
-
-    enc_name = (field.charsetnr-1 < MYSQL2_CHARSETNR_SIZE) ? mysql2_mysql_enc_to_rb[field.charsetnr-1] : NULL;
-
-    if (enc_name != NULL) {
-      /* use the field encoding we were able to match */
-      enc_index = rb_enc_find_index(enc_name);
-      rb_enc_set_index(val, enc_index);
+static VALUE mysql2_set_field_string_encoding(VALUE val, mysql2_field_meta *meta, rb_encoding *default_internal_enc, rb_encoding *conn_enc) {
+  if (meta->enc_state == 0) {
+    /* Resolve the column's encoding once; every cell in the column shares it. */
+    if ((meta->flags & BINARY_FLAG && meta->charsetnr == MYSQL2_BINARY_CHARSET) || !meta->charsetnr) {
+      /* if the binary flag is set respect its wishes; MySQL 4.x may not
+       * provide an encoding, binary will get the bytes through */
+      meta->enc_state = 1;
     } else {
-      /* otherwise fall-back to the connection's encoding */
-      rb_enc_associate(val, conn_enc);
-    }
-
-    if (default_internal_enc) {
-      val = rb_str_export_to_enc(val, default_internal_enc);
+      const char *enc_name = (meta->charsetnr-1 < MYSQL2_CHARSETNR_SIZE) ? mysql2_mysql_enc_to_rb[meta->charsetnr-1] : NULL;
+      if (enc_name != NULL) {
+        /* use the field encoding we were able to match */
+        meta->enc_index = rb_enc_find_index(enc_name);
+        meta->enc_state = 2;
+      } else {
+        /* otherwise fall-back to the connection's encoding */
+        meta->enc_state = 3;
+      }
     }
   }
+
+  switch (meta->enc_state) {
+    case 1:
+      rb_enc_associate(val, binaryEncoding);
+      return val;
+    case 2:
+      rb_enc_set_index(val, meta->enc_index);
+      break;
+    default:
+      rb_enc_associate(val, conn_enc);
+      break;
+  }
+
+  if (default_internal_enc) {
+    val = rb_str_export_to_enc(val, default_internal_enc);
+  }
   return val;
+}
+
+#ifdef HAVE_RB_TIME_TIMESPEC_NEW
+#include <limits.h>
+
+/* days_from_civil (Howard Hinnant's public-domain algorithm): proleptic
+ * Gregorian civil date -> days since 1970-01-01. */
+static inline int64_t mysql2_days_from_civil(int64_t y, unsigned int m, unsigned int d) {
+  int64_t era;
+  unsigned int yoe, doy, doe;
+  y -= m <= 2;
+  era = (y >= 0 ? y : y - 399) / 400;
+  yoe = (unsigned int)(y - era * 400);
+  doy = (153 * (m > 2 ? m - 3 : m + 9) + 2) / 5 + d - 1;
+  doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+  return era * 146097 + (int64_t)doe - 719468;
+}
+
+/* Fast Time construction for :utc results. Equivalent to
+ * Time.utc(year, month, day, hour, min, sec, usec) for in-range wall-clock
+ * components, without the varargs dispatch and per-argument boxing. Callers
+ * must validate hour/min/sec ranges (Time.utc raises on out-of-range values,
+ * epoch math would silently wrap them). */
+static VALUE mysql2_utc_time(unsigned int year, unsigned int month, unsigned int day,
+                             unsigned int hour, unsigned int min, unsigned int sec,
+                             unsigned long usec) {
+  struct timespec ts;
+  ts.tv_sec = (time_t)(mysql2_days_from_civil((int64_t)year, month, day) * 86400LL
+                       + hour * 3600 + min * 60 + sec);
+  ts.tv_nsec = (long)(usec * 1000UL);
+  return rb_time_timespec_new(&ts, INT_MAX - 1);
+}
+
+#define MYSQL2_UTC_FAST_PATH_OK(tz, hour, min, sec) \
+  ((tz) == intern_utc && (hour) < 24 && (min) < 60 && (sec) < 60)
+#endif
+
+/* Fast decimal integer parse for the overwhelmingly common case: an
+ * optionally-signed string of at most 18 digits. Cannot overflow: the digit
+ * loop's maximum value is 10^18 - 1 and C99 guarantees long long holds at
+ * least 2^63 - 1 (~9.22 * 10^18). Longer or malformed input (including any
+ * non-digit such as '+') falls back to rb_cstr2inum by returning 0. */
+static inline int mysql2_fast_atoll(const char *str, unsigned long len, long long *out) {
+  long long n = 0;
+  const char *p = str;
+  const char *end = str + len;
+  int neg = 0;
+
+  if (len == 0 || len > 19) return 0;
+  if (*p == '-') {
+    neg = 1;
+    p++;
+  }
+  if (p == end || (unsigned long)(end - p) > 18) return 0;
+  for (; p < end; p++) {
+    unsigned char d = (unsigned char)(*p - '0');
+    if (d > 9) return 0;
+    n = n * 10 + d;
+  }
+  *out = neg ? -n : n;
+  return 1;
 }
 
 /* Interpret microseconds digits left-aligned in fixed-width field.
@@ -612,29 +690,28 @@ static VALUE rb_mysql_result_fetch_row_stmt(VALUE self, MYSQL_FIELD * fields, co
   VALUE rowVal;
   unsigned int i = 0;
 
-  rb_encoding *default_internal_enc;
-  rb_encoding *conn_enc;
+  rb_encoding *default_internal_enc = args->default_internal_enc;
+  rb_encoding *conn_enc = args->conn_enc;
   GET_RESULT(self);
 
-  default_internal_enc = rb_default_internal_encoding();
-  conn_enc = rb_to_encoding(wrapper->encoding);
-
-  if (wrapper->fields == Qnil) {
-    wrapper->numberOfFields = mysql_num_fields(wrapper->result);
-    wrapper->fields = rb_ary_new2(wrapper->numberOfFields);
-  }
   if (args->asArray) {
     rowVal = rb_ary_new2(wrapper->numberOfFields);
   } else {
+#ifdef HAVE_RB_HASH_NEW_CAPA
+    rowVal = rb_hash_new_capa(wrapper->numberOfFields);
+#else
     rowVal = rb_hash_new();
+#endif
   }
 
   if (wrapper->result_buffers == NULL) {
     rb_mysql_result_alloc_result_buffers(self, fields);
-  }
-
-  if (mysql_stmt_bind_result(wrapper->stmt_wrapper->stmt, wrapper->result_buffers)) {
-    rb_raise_mysql2_stmt_error(wrapper->stmt_wrapper);
+    /* Bind once per result set: mysql_stmt_fetch keeps reading into the
+     * registered buffers, and rebinding copies the whole bind array on
+     * every row. */
+    if (mysql_stmt_bind_result(wrapper->stmt_wrapper->stmt, wrapper->result_buffers)) {
+      rb_raise_mysql2_stmt_error(wrapper->stmt_wrapper);
+    }
   }
 
   {
@@ -657,7 +734,6 @@ static VALUE rb_mysql_result_fetch_row_stmt(VALUE self, MYSQL_FIELD * fields, co
   }
 
   for (i = 0; i < wrapper->numberOfFields; i++) {
-    VALUE field = rb_mysql_result_fetch_field(self, i, args->symbolizeKeys);
     VALUE val = Qnil;
     MYSQL_TIME *ts;
 
@@ -729,6 +805,16 @@ static VALUE rb_mysql_result_fetch_row_stmt(VALUE self, MYSQL_FIELD * fields, co
           break;
         case MYSQL_TYPE_TIME:         // MYSQL_TIME
           ts = (MYSQL_TIME*)result_buffer->buffer;
+#ifdef HAVE_RB_TIME_TIMESPEC_NEW
+          if (MYSQL2_UTC_FAST_PATH_OK(args->db_timezone, ts->hour, ts->minute, ts->second)) {
+            val = mysql2_utc_time(2000, 1, 1, ts->hour, ts->minute, ts->second, ts->second_part);
+            /* app_timezone :utc needs no conversion: the value is UTC already */
+            if (args->app_timezone == intern_local) {
+              val = rb_funcall(val, intern_localtime, 0);
+            }
+            break;
+          }
+#endif
           val = rb_funcall(rb_cTime, args->db_timezone, 7, opt_time_year, opt_time_month, opt_time_month, UINT2NUM(ts->hour), UINT2NUM(ts->minute), UINT2NUM(ts->second), ULONG2NUM(ts->second_part));
           if (!NIL_P(args->app_timezone)) {
             if (args->app_timezone == intern_local) {
@@ -769,12 +855,23 @@ static VALUE rb_mysql_result_fetch_row_stmt(VALUE self, MYSQL_FIELD * fields, co
               }
             }
           } else {
-            val = rb_funcall(rb_cTime, args->db_timezone, 7, UINT2NUM(ts->year), UINT2NUM(ts->month), UINT2NUM(ts->day), UINT2NUM(ts->hour), UINT2NUM(ts->minute), UINT2NUM(ts->second), ULONG2NUM(ts->second_part));
-            if (!NIL_P(args->app_timezone)) {
+#ifdef HAVE_RB_TIME_TIMESPEC_NEW
+            if (MYSQL2_UTC_FAST_PATH_OK(args->db_timezone, ts->hour, ts->minute, ts->second)) {
+              val = mysql2_utc_time(ts->year, ts->month, ts->day, ts->hour, ts->minute, ts->second, ts->second_part);
+              /* app_timezone :utc needs no conversion: the value is UTC already */
               if (args->app_timezone == intern_local) {
                 val = rb_funcall(val, intern_localtime, 0);
-              } else { // utc
-                val = rb_funcall(val, intern_utc, 0);
+              }
+            } else
+#endif
+            {
+              val = rb_funcall(rb_cTime, args->db_timezone, 7, UINT2NUM(ts->year), UINT2NUM(ts->month), UINT2NUM(ts->day), UINT2NUM(ts->hour), UINT2NUM(ts->minute), UINT2NUM(ts->second), ULONG2NUM(ts->second_part));
+              if (!NIL_P(args->app_timezone)) {
+                if (args->app_timezone == intern_local) {
+                  val = rb_funcall(val, intern_localtime, 0);
+                } else { // utc
+                  val = rb_funcall(val, intern_utc, 0);
+                }
               }
             }
           }
@@ -796,7 +893,7 @@ static VALUE rb_mysql_result_fetch_row_stmt(VALUE self, MYSQL_FIELD * fields, co
         case MYSQL_TYPE_GEOMETRY:     // char[]
         default:
           val = rb_str_new(result_buffer->buffer, *(result_buffer->length));
-          val = mysql2_set_field_string_encoding(val, fields[i], default_internal_enc, conn_enc);
+          val = mysql2_set_field_string_encoding(val, &args->field_meta[i], default_internal_enc, conn_enc);
           break;
       }
     }
@@ -804,7 +901,7 @@ static VALUE rb_mysql_result_fetch_row_stmt(VALUE self, MYSQL_FIELD * fields, co
     if (args->asArray) {
       rb_ary_push(rowVal, val);
     } else {
-      rb_hash_aset(rowVal, field, val);
+      rb_hash_aset(rowVal, RARRAY_AREF(args->fields_ary, i), val);
     }
   }
 
@@ -818,12 +915,9 @@ static VALUE rb_mysql_result_fetch_row(VALUE self, MYSQL_FIELD * fields, const r
   unsigned int i = 0;
   unsigned long * fieldLengths;
   void * ptr;
-  rb_encoding *default_internal_enc;
-  rb_encoding *conn_enc;
+  rb_encoding *default_internal_enc = args->default_internal_enc;
+  rb_encoding *conn_enc = args->conn_enc;
   GET_RESULT(self);
-
-  default_internal_enc = rb_default_internal_encoding();
-  conn_enc = rb_to_encoding(wrapper->encoding);
 
   ptr = wrapper->result;
   row = (MYSQL_ROW)rb_thread_call_without_gvl(nogvl_fetch_row, ptr, RUBY_UBF_IO, 0);
@@ -831,19 +925,18 @@ static VALUE rb_mysql_result_fetch_row(VALUE self, MYSQL_FIELD * fields, const r
     return Qnil;
   }
 
-  if (wrapper->fields == Qnil) {
-    wrapper->numberOfFields = mysql_num_fields(wrapper->result);
-    wrapper->fields = rb_ary_new2(wrapper->numberOfFields);
-  }
   if (args->asArray) {
     rowVal = rb_ary_new2(wrapper->numberOfFields);
   } else {
+#ifdef HAVE_RB_HASH_NEW_CAPA
+    rowVal = rb_hash_new_capa(wrapper->numberOfFields);
+#else
     rowVal = rb_hash_new();
+#endif
   }
   fieldLengths = mysql_fetch_lengths(wrapper->result);
 
   for (i = 0; i < wrapper->numberOfFields; i++) {
-    VALUE field = rb_mysql_result_fetch_field(self, i, args->symbolizeKeys);
     if (row[i]) {
       VALUE val = Qnil;
       enum enum_field_types type = fields[i].type;
@@ -853,7 +946,7 @@ static VALUE rb_mysql_result_fetch_row(VALUE self, MYSQL_FIELD * fields, const r
           val = Qnil;
         } else {
           val = rb_str_new(row[i], fieldLengths[i]);
-          val = mysql2_set_field_string_encoding(val, fields[i], default_internal_enc, conn_enc);
+          val = mysql2_set_field_string_encoding(val, &args->field_meta[i], default_internal_enc, conn_enc);
         }
       } else {
         switch(type) {
@@ -876,13 +969,24 @@ static VALUE rb_mysql_result_fetch_row(VALUE self, MYSQL_FIELD * fields, const r
         case MYSQL_TYPE_LONG:       /* INTEGER field */
         case MYSQL_TYPE_INT24:      /* MEDIUMINT field */
         case MYSQL_TYPE_LONGLONG:   /* BIGINT field */
-        case MYSQL_TYPE_YEAR:       /* YEAR field */
-          val = rb_cstr2inum(row[i], 10);
+        case MYSQL_TYPE_YEAR: {    /* YEAR field */
+          long long lln;
+          if (mysql2_fast_atoll(row[i], fieldLengths[i], &lln)) {
+            val = LL2NUM(lln);
+          } else {
+            val = rb_cstr2inum(row[i], 10);
+          }
           break;
+        }
         case MYSQL_TYPE_DECIMAL:    /* DECIMAL or NUMERIC field */
         case MYSQL_TYPE_NEWDECIMAL: /* Precision math DECIMAL or NUMERIC field (MySQL 5.0.3 and up) */
           if (fields[i].decimals == 0) {
-            val = rb_cstr2inum(row[i], 10);
+            long long lln;
+            if (mysql2_fast_atoll(row[i], fieldLengths[i], &lln)) {
+              val = LL2NUM(lln);
+            } else {
+              val = rb_cstr2inum(row[i], 10);
+            }
           } else if (strtod(row[i], NULL) == 0.000000){
             val = rb_funcall(rb_mKernel, intern_BigDecimal, 1, opt_decimal_zero);
           }else{
@@ -911,6 +1015,16 @@ static VALUE rb_mysql_result_fetch_row(VALUE self, MYSQL_FIELD * fields, const r
             break;
           }
           msec = msec_char_to_uint(msec_char, sizeof(msec_char));
+#ifdef HAVE_RB_TIME_TIMESPEC_NEW
+          if (MYSQL2_UTC_FAST_PATH_OK(args->db_timezone, hour, min, sec)) {
+            val = mysql2_utc_time(2000, 1, 1, hour, min, sec, msec);
+            /* app_timezone :utc needs no conversion: the value is UTC already */
+            if (args->app_timezone == intern_local) {
+              val = rb_funcall(val, intern_localtime, 0);
+            }
+            break;
+          }
+#endif
           val = rb_funcall(rb_cTime, args->db_timezone, 7, opt_time_year, opt_time_month, opt_time_month, UINT2NUM(hour), UINT2NUM(min), UINT2NUM(sec), UINT2NUM(msec));
           if (!NIL_P(args->app_timezone)) {
             if (args->app_timezone == intern_local) {
@@ -958,12 +1072,23 @@ static VALUE rb_mysql_result_fetch_row(VALUE self, MYSQL_FIELD * fields, const r
                 }
               } else {
                 msec = msec_char_to_uint(msec_char, sizeof(msec_char));
-                val = rb_funcall(rb_cTime, args->db_timezone, 7, UINT2NUM(year), UINT2NUM(month), UINT2NUM(day), UINT2NUM(hour), UINT2NUM(min), UINT2NUM(sec), UINT2NUM(msec));
-                if (!NIL_P(args->app_timezone)) {
+#ifdef HAVE_RB_TIME_TIMESPEC_NEW
+                if (MYSQL2_UTC_FAST_PATH_OK(args->db_timezone, hour, min, sec)) {
+                  val = mysql2_utc_time(year, month, day, hour, min, sec, msec);
+                  /* app_timezone :utc needs no conversion: the value is UTC already */
                   if (args->app_timezone == intern_local) {
                     val = rb_funcall(val, intern_localtime, 0);
-                  } else { /* utc */
-                    val = rb_funcall(val, intern_utc, 0);
+                  }
+                } else
+#endif
+                {
+                  val = rb_funcall(rb_cTime, args->db_timezone, 7, UINT2NUM(year), UINT2NUM(month), UINT2NUM(day), UINT2NUM(hour), UINT2NUM(min), UINT2NUM(sec), UINT2NUM(msec));
+                  if (!NIL_P(args->app_timezone)) {
+                    if (args->app_timezone == intern_local) {
+                      val = rb_funcall(val, intern_localtime, 0);
+                    } else { /* utc */
+                      val = rb_funcall(val, intern_utc, 0);
+                    }
                   }
                 }
               }
@@ -1004,20 +1129,20 @@ static VALUE rb_mysql_result_fetch_row(VALUE self, MYSQL_FIELD * fields, const r
         case MYSQL_TYPE_GEOMETRY:   /* Spatial fielda */
         default:
           val = rb_str_new(row[i], fieldLengths[i]);
-          val = mysql2_set_field_string_encoding(val, fields[i], default_internal_enc, conn_enc);
+          val = mysql2_set_field_string_encoding(val, &args->field_meta[i], default_internal_enc, conn_enc);
           break;
         }
       }
       if (args->asArray) {
         rb_ary_push(rowVal, val);
       } else {
-        rb_hash_aset(rowVal, field, val);
+        rb_hash_aset(rowVal, RARRAY_AREF(args->fields_ary, i), val);
       }
     } else {
       if (args->asArray) {
         rb_ary_push(rowVal, Qnil);
       } else {
-        rb_hash_aset(rowVal, field, Qnil);
+        rb_hash_aset(rowVal, RARRAY_AREF(args->fields_ary, i), Qnil);
       }
     }
   }
@@ -1212,6 +1337,13 @@ static VALUE rb_mysql_result_each(int argc, VALUE * argv, VALUE self) {
     rb_warn(":cast is forced for prepared statements");
   }
 
+  /* A freed result can only be re-iterated from the fully cached rows array;
+   * anything else would dereference the freed MYSQL_RES. */
+  if (wrapper->resultFreed && !wrapper->is_streaming &&
+      !(cacheRows && wrapper->rows != Qnil && wrapper->lastRowProcessed == wrapper->numberOfRows)) {
+    rb_raise(cMysql2Error, "Result set has already been freed");
+  }
+
   dbTz = rb_hash_aref(opts, sym_database_timezone);
   if (dbTz == sym_local) {
     db_timezone = intern_local;
@@ -1235,14 +1367,17 @@ static VALUE rb_mysql_result_each(int argc, VALUE * argv, VALUE self) {
 
   if (wrapper->rows == Qnil && !wrapper->is_streaming) {
     wrapper->numberOfRows = wrapper->stmt_wrapper ? mysql_stmt_num_rows(wrapper->stmt_wrapper->stmt) : mysql_num_rows(wrapper->result);
-    wrapper->rows = rb_ary_new2(wrapper->numberOfRows);
+    /* Only reserve per-row capacity when rows will actually be cached;
+     * with cache_rows: false the array stays empty and a full-result
+     * capacity reservation is pure dead weight (8 bytes per row). */
+    wrapper->rows = cacheRows ? rb_ary_new2(wrapper->numberOfRows) : rb_ary_new();
   } else if (wrapper->rows && !cacheRows) {
     if (wrapper->resultFreed) {
       rb_raise(cMysql2Error, "Result set has already been freed");
     }
     mysql_data_seek(wrapper->result, 0);
     wrapper->lastRowProcessed = 0;
-    wrapper->rows = rb_ary_new2(wrapper->numberOfRows);
+    wrapper->rows = rb_ary_new();
   }
 
   // Backward compat
@@ -1254,6 +1389,25 @@ static VALUE rb_mysql_result_each(int argc, VALUE * argv, VALUE self) {
   args.db_timezone = db_timezone;
   args.app_timezone = app_timezone;
   args.block_given = rb_block_given_p();
+
+  /* Resolve per-call hot-path state once, instead of per row or per cell.
+   * The local VALUE keeps the fields array pinned via conservative stack
+   * marking for the duration of the iteration. */
+  args.fields_ary = Qnil;
+  if (!asArray && !(wrapper->resultFreed && cacheRows)) {
+    unsigned int fi;
+    if (wrapper->numberOfFields == 0 && !wrapper->resultFreed) {
+      wrapper->numberOfFields = mysql_num_fields(wrapper->result);
+    }
+    for (fi = 0; fi < wrapper->numberOfFields; fi++) {
+      rb_mysql_result_fetch_field(self, fi, symbolizeKeys);
+    }
+    args.fields_ary = symbolizeKeys ? wrapper->fieldSymbols : wrapper->fields;
+  }
+  args.default_internal_enc = rb_default_internal_encoding();
+  args.conn_enc = rb_to_encoding(wrapper->encoding);
+  rb_mysql_result_capture_field_meta(wrapper);
+  args.field_meta = wrapper->field_meta;
 
   if (wrapper->stmt_wrapper) {
     fetch_row_func = rb_mysql_result_fetch_row_stmt;

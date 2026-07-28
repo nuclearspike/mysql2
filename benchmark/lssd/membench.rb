@@ -30,7 +30,7 @@ after_free = rss_kb
 
 out = { variant: variant, ts: Time.now.utc.iso8601,
         rows_array_memsize_bytes: rows_memsize,
-        rss_base_kb: base, rss_peak_kb: peak, rss_after_free_kb: after_free }
+        rss_base_kb: base, rss_peak_kb: peak, rss_after_free_kb: after_free, }
 puts JSON.pretty_generate(out)
 dir = File.expand_path('../../experiments/artifacts', __dir__)
 Dir.mkdir(dir) unless Dir.exist?(dir)

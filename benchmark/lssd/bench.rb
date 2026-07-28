@@ -1,6 +1,7 @@
-# benchmark.mysql2.row_materialization 1.0.0 — timing + allocation runner
+# benchmark.mysql2.row_materialization — timing + allocation runner (LSSD lab harness)
 # Usage: ruby benchmark/lssd/bench.rb <variant-name> [run-index]
-$LOAD_PATH.unshift File.expand_path('../../lib', __dir__)
+# rubocop:disable Naming/MethodParameterName, Style/FormatStringToken
+$LOAD_PATH.unshift(ENV['MYSQL2_LIB'] || File.expand_path('../../lib', __dir__))
 require 'mysql2'
 require 'yaml'
 require 'json'
@@ -32,7 +33,7 @@ def mad(a)
   median(a.map { |x| (x - m).abs })
 end
 
-WORKLOADS = {}
+WORKLOADS = {}.freeze
 
 def workload(name, &blk)
   WORKLOADS[name] = blk
@@ -46,11 +47,16 @@ workload('wide_q')      { |c| c.query('SELECT * FROM t_wide').to_a }
 workload('mixed_array_q') { |c| c.query('SELECT * FROM t_mixed', as: :array).to_a }
 workload('mixed_nocast_q') { |c| c.query('SELECT * FROM t_mixed', cast: false).to_a }
 workload('mixed_symbolized_q') { |c| c.query('SELECT * FROM t_mixed', symbolize_keys: true).to_a }
+# benchmark 1.1.0: database_timezone :utc variants (the Rails/production default;
+# the gem default :local exercises Time.local instead)
+workload('datetimes_utc_q') { |c| c.query('SELECT * FROM t_datetimes', database_timezone: :utc).to_a }
+workload('mixed_utc_q')     { |c| c.query('SELECT * FROM t_mixed', database_timezone: :utc).to_a }
 
-STMTS = {}
+STMTS = {}.freeze
 workload('ints_stmt')      { |c| (STMTS['ints'] ||= c.prepare('SELECT * FROM t_ints')).execute.to_a }
 workload('datetimes_stmt') { |c| (STMTS['datetimes'] ||= c.prepare('SELECT * FROM t_datetimes')).execute.to_a }
 workload('mixed_stmt')     { |c| (STMTS['mixed'] ||= c.prepare('SELECT * FROM t_mixed')).execute.to_a }
+workload('datetimes_utc_stmt') { |c| (STMTS['datetimes'] ||= c.prepare('SELECT * FROM t_datetimes')).execute(database_timezone: :utc).to_a }
 
 results = {}
 WORKLOADS.each do |name, blk|
@@ -80,3 +86,5 @@ Dir.mkdir(dir) unless Dir.exist?(dir)
 path = File.join(dir, "bench-#{variant}-#{run_idx}.json")
 File.write(path, JSON.pretty_generate(out))
 puts path
+
+# rubocop:enable Naming/MethodParameterName, Style/FormatStringToken
