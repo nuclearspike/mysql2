@@ -298,6 +298,33 @@ finding finding.mysql2.rowmat.upstream_bugs {
 }
 ```
 
+## Multi-model review conference (2026-07-28, post-conclusion)
+
+```lssd
+experiment_trial trial.mysql2.rowmat.review_conference of @experiment.mysql2.rowmat_hotpath {
+  experimentVersion: "1.0.0"
+  experimentFingerprint: "sha256:7d6de9ae6af62328a6fc16d722d70876debc041f2c28abe7fec731ad9c59964c"
+  trialOutcome: completed
+  occurredAt: "2026-07-28T14:30:00Z"
+  variant: "adversarial multi-model review of the full diff (not a perf variant)"
+  executions: ["12 units x 3 passes (cloud-reasoning prioritized, cloud adversarial, local qwen3-coder-30b direct) + qwen3.6-35b-a3b whole-diff integration pass; 37 completed reviews; artifacts in session scratchpad conference/ (U*-P*.md, P4-integration.md)"]
+  inputs: [{ role: package, description: "complete d4f8c13..HEAD diff of ext/ and spec/ plus commit messages, 1008 lines, untruncated per standing rule" }]
+  resolvedParameters: { units: 12, passes_per_unit: 3, integration_passes: 1 }
+  environment: { hub: "127.0.0.1:4200 (cloud lanes)", local: "LM Studio 127.0.0.1:1234 direct - hub local lane misroutes qwen pins to deprecated OpenAI codex models (defect filed as spawned task)", models: "cloud reasoning lane, qwen3-coder-30b (32k ctx), qwen3.6-35b-a3b (262k ctx)" }
+  outputs: ["commit aca4472 (fixes + 9 regression specs)", "suite 366 examples 0 failures", "bench sanity within noise: ints 46.1ms, mixed_utc 87.0ms, datetimes_utc_stmt 62.9ms"]
+  evidence: []
+  verdicts: {
+    real_findings_fixed: "5: (1) streaming .fields before iteration returned nil [cloud-prioritized U1]; (2) freed-replay nil-rows hole - predicate needed rows-length check, also latent at upstream HEAD [cloud-prioritized U5]; (3) freed incomplete-streaming iteration could deref freed MYSQL_RES [cloud-prioritized U5]; (4) as: :array starved #fields after streaming iteration [cloud-prioritized U6]; (5) free() inside the iteration block caused next-row UAF, pre-existing upstream [qwen3.6-35b integration pass]",
+    hardening_adopted: "month/day/usec fast-path bounds, <time.h>, %.*s int casts, per-row default_internal restoration (parity), fail-fast meta guard",
+    dismissed_with_reason: "~40 claims incl. two mutually-contradictory rb_time_timespec_new sentinel claims (settled empirically: INT_MAX-1 is UTC, proven by range-edge spec on a UTC-6 host), GC compaction fears (conservative stack marking pins C-local VALUEs; TypedData payloads do not move), xcalloc NULL/overflow claims (Ruby xcalloc raises, checked multiply), streaming as: :array empty-rows claim (flawed repro - blockless each returns the rows array, not an Enumerator; correct-block repro verified fine)",
+    lane_quality: "cloud prioritized passes found 4 of 5 real bugs and produced 3 verified-SOUND verdicts; cloud adversarial passes contributed corroboration and the F2 length-check shape; qwen3-coder passes were verbose, self-contradictory, zero unique real findings; qwen3.6-35b burned 3000-then-9000 token budgets entirely on hidden reasoning (empty visible output twice) but its extracted reasoning contained the one finding every other lane missed"
+  }
+  deviations: ["Hub local lane down (stale codex aliases): 12 local passes + integration pass ran direct against LM Studio, bypassing hub logging - stated, not silent", "P3/P4 rerun after initial failures; 6 adversarial passes rerun on the reasoning lane after the code lane 404'd"]
+  status: observed
+  confidence: 0.95
+}
+```
+
 ## Post-conclusion hardening (2026-07-28)
 
 Portability defect found while reviewing version constraints, after the final A/B:
