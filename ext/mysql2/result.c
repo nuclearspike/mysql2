@@ -207,9 +207,13 @@ static VALUE rb_mysql_result_free_(VALUE self) {
 }
 
 /*
- * for small results, this won't hit the network, but there's no
- * reliable way for us to tell this so we'll always release the GVL
- * to be safe
+ * Only a streaming result (mysql_use_result / mysql_stmt_use_result) can hit
+ * the network from a row fetch. A buffered result has already been read into
+ * client memory by mysql_store_result / mysql_stmt_store_result, so its row
+ * fetch is pure pointer arithmetic and cannot block - and releasing the GVL
+ * around it costs far more than the fetch itself (measured at ~21% of wall
+ * time on a 20k-row result, virtually all of it setjmp/sigprocmask, versus
+ * ~0.1% in the fetch). wrapper->is_streaming tells the two apart reliably.
  */
 static void *nogvl_fetch_row(void *ptr) {
   MYSQL_RES *result = ptr;
@@ -607,6 +611,61 @@ static inline int mysql2_fast_atoll(const char *str, unsigned long len, long lon
   return 1;
 }
 
+/* Read exactly n decimal digits. Returns 0 (leaving *out untouched) on any
+ * non-digit, so callers can fall back to the general parser. */
+static inline int mysql2_read_uint(const char *p, int n, unsigned int *out) {
+  unsigned int v = 0;
+  int i;
+  for (i = 0; i < n; i++) {
+    unsigned char d = (unsigned char)(p[i] - '0');
+    if (d > 9) return 0;
+    v = v * 10 + d;
+  }
+  *out = v;
+  return 1;
+}
+
+/* Fast path for the canonical wire format the server actually sends:
+ * YYYY-MM-DD HH:MM:SS[.ffffff] (fractional digits are left-aligned, so ".5"
+ * means 500000 microseconds, matching msec_char_to_uint). Anything that does
+ * not match exactly returns 0 and the caller falls back to sscanf, which keeps
+ * the original semantics for unusual input. sscanf measured at ~6% of wall
+ * time on a datetime-bearing 20k-row result. */
+static int mysql2_parse_datetime(const char *s, unsigned long len,
+                                 unsigned int *year, unsigned int *month, unsigned int *day,
+                                 unsigned int *hour, unsigned int *min, unsigned int *sec,
+                                 unsigned int *msec) {
+  unsigned int frac = 0;
+
+  if (len < 19 || len > 26) return 0;
+  if (s[4] != '-' || s[7] != '-' || s[10] != ' ' || s[13] != ':' || s[16] != ':') return 0;
+  if (!mysql2_read_uint(s, 4, year) || !mysql2_read_uint(s + 5, 2, month) ||
+      !mysql2_read_uint(s + 8, 2, day) || !mysql2_read_uint(s + 11, 2, hour) ||
+      !mysql2_read_uint(s + 14, 2, min) || !mysql2_read_uint(s + 17, 2, sec)) return 0;
+
+  if (len > 19) {
+    unsigned long i;
+    unsigned int scale = 100000;
+    if (s[19] != '.' || len == 20) return 0;
+    for (i = 20; i < len; i++) {
+      unsigned char d = (unsigned char)(s[i] - '0');
+      if (d > 9) return 0;
+      frac += d * scale;
+      scale /= 10;
+    }
+  }
+  *msec = frac;
+  return 1;
+}
+
+/* Fast path for the canonical DATE wire format YYYY-MM-DD. */
+static int mysql2_parse_date(const char *s, unsigned long len,
+                             unsigned int *year, unsigned int *month, unsigned int *day) {
+  if (len != 10 || s[4] != '-' || s[7] != '-') return 0;
+  return mysql2_read_uint(s, 4, year) && mysql2_read_uint(s + 5, 2, month) &&
+         mysql2_read_uint(s + 8, 2, day);
+}
+
 /* Interpret microseconds digits left-aligned in fixed-width field.
  * e.g. 10.123 seconds means 10 seconds and 123000 microseconds,
  * because the microseconds are to the right of the decimal point.
@@ -733,7 +792,13 @@ static VALUE rb_mysql_result_fetch_row_stmt(VALUE self, MYSQL_FIELD * fields, co
   }
 
   {
-    switch((uintptr_t)rb_thread_call_without_gvl(nogvl_stmt_fetch, wrapper->stmt_wrapper->stmt, RUBY_UBF_IO, 0)) {
+    uintptr_t fetch_result;
+    if (wrapper->is_streaming) {
+      fetch_result = (uintptr_t)rb_thread_call_without_gvl(nogvl_stmt_fetch, wrapper->stmt_wrapper->stmt, RUBY_UBF_IO, 0);
+    } else {
+      fetch_result = (uintptr_t)nogvl_stmt_fetch(wrapper->stmt_wrapper->stmt);
+    }
+    switch(fetch_result) {
       case 0:
         /* success */
         break;
@@ -951,7 +1016,11 @@ static VALUE rb_mysql_result_fetch_row(VALUE self, MYSQL_FIELD * fields, const r
   }
 
   ptr = wrapper->result;
-  row = (MYSQL_ROW)rb_thread_call_without_gvl(nogvl_fetch_row, ptr, RUBY_UBF_IO, 0);
+  if (wrapper->is_streaming) {
+    row = (MYSQL_ROW)rb_thread_call_without_gvl(nogvl_fetch_row, ptr, RUBY_UBF_IO, 0);
+  } else {
+    row = mysql_fetch_row(wrapper->result);
+  }
   if (row == NULL) {
     return Qnil;
   }
@@ -1071,14 +1140,19 @@ static VALUE rb_mysql_result_fetch_row(VALUE self, MYSQL_FIELD * fields, const r
         case MYSQL_TYPE_TIMESTAMP:  /* TIMESTAMP field */
         case MYSQL_TYPE_DATETIME: { /* DATETIME field */
           int tokens;
+          int parsed_msec = 0;
           unsigned int year=0, month=0, day=0, hour=0, min=0, sec=0, msec=0;
           char msec_char[7] = {'0','0','0','0','0','0','\0'};
           uint64_t seconds;
 
-          tokens = sscanf(row[i], "%4u-%2u-%2u %2u:%2u:%2u.%6s", &year, &month, &day, &hour, &min, &sec, msec_char);
-          if (tokens < 6) { /* msec might be empty */
-            val = Qnil;
-            break;
+          if (mysql2_parse_datetime(row[i], fieldLengths[i], &year, &month, &day, &hour, &min, &sec, &msec)) {
+            parsed_msec = 1;
+          } else {
+            tokens = sscanf(row[i], "%4u-%2u-%2u %2u:%2u:%2u.%6s", &year, &month, &day, &hour, &min, &sec, msec_char);
+            if (tokens < 6) { /* msec might be empty */
+              val = Qnil;
+              break;
+            }
           }
           seconds = (year*31557600ULL) + (month*2592000ULL) + (day*86400ULL) + (hour*3600ULL) + (min*60ULL) + sec;
 
@@ -1104,7 +1178,9 @@ static VALUE rb_mysql_result_fetch_row(VALUE self, MYSQL_FIELD * fields, const r
                   }
                 }
               } else {
-                msec = msec_char_to_uint(msec_char, sizeof(msec_char));
+                if (!parsed_msec) {
+                  msec = msec_char_to_uint(msec_char, sizeof(msec_char));
+                }
 #ifdef HAVE_RB_TIME_TIMESPEC_NEW
                 /* month/day lower bounds were validated above; the upper bounds
                  * keep silently-wrong epochs impossible for corrupt input (the
@@ -1138,10 +1214,12 @@ static VALUE rb_mysql_result_fetch_row(VALUE self, MYSQL_FIELD * fields, const r
         case MYSQL_TYPE_NEWDATE: {  /* Newer const used > 5.0 */
           int tokens;
           unsigned int year=0, month=0, day=0;
-          tokens = sscanf(row[i], "%4u-%2u-%2u", &year, &month, &day);
-          if (tokens < 3) {
-            val = Qnil;
-            break;
+          if (!mysql2_parse_date(row[i], fieldLengths[i], &year, &month, &day)) {
+            tokens = sscanf(row[i], "%4u-%2u-%2u", &year, &month, &day);
+            if (tokens < 3) {
+              val = Qnil;
+              break;
+            }
           }
           if (year+month+day == 0) {
             val = Qnil;
