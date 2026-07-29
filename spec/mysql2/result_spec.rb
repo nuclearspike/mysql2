@@ -1,6 +1,6 @@
 require 'spec_helper'
 
-RSpec.describe Mysql2::Result do
+RSpec.describe Mysql2::Result do # rubocop:disable Metrics/BlockLength
   before(:example) do
     @result = @client.query "SELECT 1"
   end
@@ -20,6 +20,91 @@ RSpec.describe Mysql2::Result do
 
   it "should respond to #free" do
     expect(@result).to respond_to(:free)
+  end
+
+  it "should cast DATETIME(6) values identically for :utc and via prepared statements" do
+    # Guards the C fast path for :utc Time construction against the generic
+    # Time.utc path across range and microsecond edges.
+    values = ['0000-01-01 00:00:00.000000', '1000-01-01 23:59:59.999999',
+              '1969-12-31 23:59:59.123456', '1970-01-01 00:00:00.000001',
+              '2026-07-28 12:34:56.654321', '9999-12-31 11:59:59.500000',]
+    values.each do |v|
+      expected = Time.utc(*v.split(/[- :.]/).map(&:to_i)[0, 6]) + Rational(v.split('.').last.to_i, 1_000_000)
+      text = @client.query("SELECT CAST('#{v}' AS DATETIME(6)) AS t", database_timezone: :utc).first['t']
+      stmt = @client.prepare("SELECT CAST('#{v}' AS DATETIME(6)) AS t").execute(database_timezone: :utc).first['t']
+      expect(text).to eql(expected), "text cast mismatch for #{v}: got #{text.inspect}"
+      expect(stmt).to eql(expected), "stmt cast mismatch for #{v}: got #{stmt.inspect}"
+      expect(text.utc_offset).to eql(0)
+      expect(text.usec).to eql(v.split('.').last.to_i)
+    end
+  end
+
+  it "should raise when iterating a result freed before being fully cached" do
+    result = @client.query "SELECT 1"
+    result.free
+    expect { result.each.to_a }.to raise_error(Mysql2::Error, "Result set has already been freed")
+  end
+
+  it "should raise when iterating a freed cache_rows: false result instead of replaying nil rows" do
+    result = @client.query "SELECT 1 AS a UNION SELECT 2", cache_rows: false
+    result.each { |_| }
+    result.free
+    expect { result.to_a }.to raise_error(Mysql2::Error, "Result set has already been freed")
+  end
+
+  it "should raise when iterating a streaming result freed before completion" do
+    result = @client.query "SELECT 1 AS a UNION SELECT 2", stream: true, cache_rows: false
+    result.free
+    expect { result.each { |_| } }.to raise_error(Mysql2::Error, "Result set has already been freed")
+  end
+
+  it "should expose fields on a streaming result before iteration" do
+    result = @client.query "SELECT 1 AS only_col", stream: true, cache_rows: false
+    expect(result.fields).to eql(["only_col"])
+    result.each { |_| }
+  end
+
+  it "should keep fields available after streaming as: :array iteration" do
+    result = @client.query "SELECT 1 AS a, 2 AS b", stream: true, cache_rows: false, as: :array
+    rows = []
+    result.each { |row| rows << row }
+    expect(rows).to eql([[1, 2]])
+    expect(result.fields).to eql(%w[a b])
+  end
+
+  it "should honor each(symbolize_keys: false) when the query had symbolize_keys: true" do
+    result = @client.query "SELECT 1 AS a", symbolize_keys: true
+    result.each(symbolize_keys: false, cache_rows: false) do |row|
+      expect(row.keys.first).to eql("a")
+    end
+    expect(result.fields).to eql([:a])
+  end
+
+  it "should keep field_types available after an explicit free before any metadata call" do
+    result = @client.query "SELECT CAST(1 AS SIGNED) AS n"
+    result.free
+    expect(result.field_types.length).to eql(1)
+
+    stmt_result = @client.prepare("SELECT CAST(1 AS SIGNED) AS n").execute
+    stmt_result.free
+    expect(stmt_result.field_types.length).to eql(1)
+  end
+
+  it "should stop iterating cleanly when the result is freed inside the block" do
+    result = @client.query "SELECT 1 AS a UNION SELECT 2 UNION SELECT 3"
+    seen = []
+    result.each do |row|
+      seen << row
+      result.free
+    end
+    expect(seen).to eql([{ "a" => 1 }])
+  end
+
+  it "should still replay cached rows after the result is freed" do
+    result = @client.query "SELECT 1 AS a UNION SELECT 2"
+    rows = result.to_a # fully cached; C result auto-freed here
+    result.free
+    expect(result.to_a).to eql(rows)
   end
 
   it "should raise a Mysql2::Error exception upon a bad query" do

@@ -481,6 +481,43 @@ RSpec.describe Mysql2::Statement do # rubocop:disable Metrics/BlockLength
       expect(test_result['enum_test']).to eql('val1')
     end
 
+    context "zero and partial-zero dates" do
+      before do
+        @client.query("SET SESSION sql_mode = ''")
+        @client.query("DROP TABLE IF EXISTS mysql2_zero_dates")
+        @client.query("CREATE TABLE mysql2_zero_dates (d DATE, dt DATETIME, ts_test TIMESTAMP NULL)")
+        @client.query("INSERT INTO mysql2_zero_dates VALUES ('0000-00-00', '0000-00-00 00:00:00', NULL)")
+      end
+
+      after do
+        @client.query("DROP TABLE IF EXISTS mysql2_zero_dates")
+      end
+
+      it "returns nil for zero dates over the binary protocol, matching the text protocol" do
+        @client.query("UPDATE mysql2_zero_dates SET ts_test = '0000-00-00 00:00:00'")
+        text_row = @client.query("SELECT * FROM mysql2_zero_dates").first
+        stmt_row = @client.prepare("SELECT * FROM mysql2_zero_dates").execute.first
+        expect(text_row).to eql("d" => nil, "dt" => nil, "ts_test" => nil)
+        expect(stmt_row).to eql(text_row)
+      end
+
+      it "raises Mysql2::Error for partial-zero dates over both protocols" do
+        @client.query("UPDATE mysql2_zero_dates SET dt = '1972-00-27 00:00:00'")
+        expect { @client.query("SELECT dt FROM mysql2_zero_dates").to_a }.to \
+          raise_error(Mysql2::Error, /Invalid date in field 'dt'/)
+        expect { @client.prepare("SELECT dt FROM mysql2_zero_dates").execute.to_a }.to \
+          raise_error(Mysql2::Error, /Invalid date in field 'dt'/)
+      end
+
+      it "raises Mysql2::Error for partial-zero DATE values over both protocols" do
+        @client.query("UPDATE mysql2_zero_dates SET d = '1972-00-27'")
+        expect { @client.query("SELECT d FROM mysql2_zero_dates").to_a }.to \
+          raise_error(Mysql2::Error, /Invalid date in field 'd'/)
+        expect { @client.prepare("SELECT d FROM mysql2_zero_dates").execute.to_a }.to \
+          raise_error(Mysql2::Error, /Invalid date in field 'd'/)
+      end
+    end
+
     it "should raise an error given an invalid DATETIME" do
       server_info = @client.server_info
       if server_info[:version].include?('MariaDB') || server_info[:id] < 80000
