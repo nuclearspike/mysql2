@@ -1577,6 +1577,228 @@ static VALUE rb_mysql_result_count(VALUE self) {
   }
 }
 
+/* ---------------------------------------------------------------------------
+ * Experimental: Result#write_json(spec) -> String
+ *
+ * Emits a JSON array of objects directly from the text-protocol wire values,
+ * without materializing any per-row Ruby objects. One Ruby String is
+ * allocated for the entire response body.
+ *
+ * spec is an Array of entries:
+ *   [key, column_index, type]  type in :int, :float, :str, :bool, :raw
+ *   [key, :obj, sub_spec]      nested object built from the same row
+ * Any SQL NULL emits null. :bool maps wire "0" -> false, else true.
+ * Strings pass UTF-8 through raw and escape per JSON (matching Ruby #to_json,
+ * which does not escape '/'). Floats print shortest-roundtrip like Ruby.
+ * ------------------------------------------------------------------------- */
+
+typedef struct {
+  char *buf;
+  size_t len;
+  size_t cap;
+} mysql2_jbuf;
+
+static void jbuf_grow(mysql2_jbuf *b, size_t need) {
+  size_t want = b->len + need;
+  if (want <= b->cap) return;
+  while (b->cap < want) b->cap *= 2;
+  REALLOC_N(b->buf, char, b->cap);
+}
+
+static inline void jbuf_put(mysql2_jbuf *b, const char *s, size_t n) {
+  jbuf_grow(b, n);
+  memcpy(b->buf + b->len, s, n);
+  b->len += n;
+}
+
+static inline void jbuf_putc(mysql2_jbuf *b, char c) {
+  jbuf_grow(b, 1);
+  b->buf[b->len++] = c;
+}
+
+static void jbuf_put_escaped(mysql2_jbuf *b, const char *s, size_t n) {
+  size_t i, run = 0;
+  jbuf_putc(b, '"');
+  for (i = 0; i < n; i++) {
+    unsigned char c = (unsigned char)s[i];
+    if (c == '"' || c == '\\' || c < 0x20) {
+      char esc[8];
+      int el;
+      if (run) { jbuf_put(b, s + i - run, run); run = 0; }
+      switch (c) {
+        case '"':  esc[0] = '\\'; esc[1] = '"';  el = 2; break;
+        case '\\': esc[0] = '\\'; esc[1] = '\\'; el = 2; break;
+        case '\b': esc[0] = '\\'; esc[1] = 'b';  el = 2; break;
+        case '\f': esc[0] = '\\'; esc[1] = 'f';  el = 2; break;
+        case '\n': esc[0] = '\\'; esc[1] = 'n';  el = 2; break;
+        case '\r': esc[0] = '\\'; esc[1] = 'r';  el = 2; break;
+        case '\t': esc[0] = '\\'; esc[1] = 't';  el = 2; break;
+        default:   el = snprintf(esc, sizeof(esc), "\\u%04x", c); break;
+      }
+      jbuf_put(b, esc, (size_t)el);
+    } else {
+      run++;
+    }
+  }
+  if (run) jbuf_put(b, s + n - run, run);
+  jbuf_putc(b, '"');
+}
+
+/* Shortest decimal representation that round-trips, like Ruby's Float#to_s. */
+static void jbuf_put_double(mysql2_jbuf *b, double d) {
+  char tmp[32];
+  int prec, n = 0;
+  for (prec = 1; prec <= 17; prec++) {
+    n = snprintf(tmp, sizeof(tmp), "%.*g", prec, d);
+    if (strtod(tmp, NULL) == d) break;
+  }
+  jbuf_put(b, tmp, (size_t)n);
+}
+
+#define MYSQL2_JSON_T_INT   0
+#define MYSQL2_JSON_T_FLOAT 1
+#define MYSQL2_JSON_T_STR   2
+#define MYSQL2_JSON_T_BOOL  3
+#define MYSQL2_JSON_T_RAW   4
+#define MYSQL2_JSON_T_OBJ   5
+
+typedef struct mysql2_json_field {
+  const char *key;
+  long key_len;
+  int type;
+  long col;
+  long sub_off; /* index into the flat field table for T_OBJ */
+  long sub_len;
+} mysql2_json_field;
+
+static VALUE sym_obj, sym_int, sym_float, sym_str, sym_bool, sym_raw;
+
+/* Flatten the Ruby spec into a C table (nested specs appended after parents). */
+static long mysql2_json_compile(VALUE spec, mysql2_json_field *tab, long *used, long max, unsigned int ncols) {
+  long i, n = RARRAY_LEN(spec);
+  long base = *used;
+  if (base + n > max) rb_raise(rb_eArgError, "write_json: spec too large");
+  *used += n;
+  for (i = 0; i < n; i++) {
+    VALUE e = rb_ary_entry(spec, i);
+    VALUE key, kind;
+    mysql2_json_field *f = &tab[base + i];
+    Check_Type(e, T_ARRAY);
+    if (RARRAY_LEN(e) != 3) rb_raise(rb_eArgError, "write_json: each spec entry needs 3 elements");
+    key = rb_ary_entry(e, 0);
+    Check_Type(key, T_STRING);
+    f->key = RSTRING_PTR(key);
+    f->key_len = RSTRING_LEN(key);
+    kind = rb_ary_entry(e, 1);
+    if (kind == sym_obj) {
+      f->type = MYSQL2_JSON_T_OBJ;
+      f->col = -1;
+      f->sub_off = *used;
+      f->sub_len = mysql2_json_compile(rb_ary_entry(e, 2), tab, used, max, ncols);
+    } else {
+      VALUE t = rb_ary_entry(e, 2);
+      f->col = NUM2LONG(kind);
+      if (f->col < 0 || f->col >= (long)ncols) rb_raise(rb_eArgError, "write_json: column %ld out of range", f->col);
+      if      (t == sym_int)   f->type = MYSQL2_JSON_T_INT;
+      else if (t == sym_float) f->type = MYSQL2_JSON_T_FLOAT;
+      else if (t == sym_str)   f->type = MYSQL2_JSON_T_STR;
+      else if (t == sym_bool)  f->type = MYSQL2_JSON_T_BOOL;
+      else if (t == sym_raw)   f->type = MYSQL2_JSON_T_RAW;
+      else rb_raise(rb_eArgError, "write_json: unknown type");
+      f->sub_off = 0;
+      f->sub_len = 0;
+    }
+  }
+  return n;
+}
+
+static void mysql2_json_emit_fields(mysql2_jbuf *b, const mysql2_json_field *tab, long off, long n,
+                                    MYSQL_ROW row, unsigned long *lens) {
+  long i;
+  jbuf_putc(b, '{');
+  for (i = 0; i < n; i++) {
+    const mysql2_json_field *f = &tab[off + i];
+    if (i) jbuf_putc(b, ',');
+    jbuf_putc(b, '"');
+    jbuf_put(b, f->key, (size_t)f->key_len);
+    jbuf_put(b, "\":", 2);
+    if (f->type == MYSQL2_JSON_T_OBJ) {
+      mysql2_json_emit_fields(b, tab, f->sub_off, f->sub_len, row, lens);
+      continue;
+    }
+    if (row[f->col] == NULL) {
+      jbuf_put(b, "null", 4);
+      continue;
+    }
+    switch (f->type) {
+      case MYSQL2_JSON_T_INT:
+      case MYSQL2_JSON_T_RAW:
+        jbuf_put(b, row[f->col], lens[f->col]);
+        break;
+      case MYSQL2_JSON_T_FLOAT:
+        jbuf_put_double(b, strtod(row[f->col], NULL));
+        break;
+      case MYSQL2_JSON_T_BOOL:
+        if (lens[f->col] == 1 && row[f->col][0] == '0') jbuf_put(b, "false", 5);
+        else jbuf_put(b, "true", 4);
+        break;
+      default:
+        jbuf_put_escaped(b, row[f->col], lens[f->col]);
+        break;
+    }
+  }
+  jbuf_putc(b, '}');
+}
+
+static VALUE rb_mysql_result_write_json(VALUE self, VALUE spec) {
+  mysql2_jbuf b;
+  mysql2_json_field *tab;
+  long used = 0, top_n, max_fields;
+  int first = 1;
+  MYSQL_ROW row;
+  VALUE out;
+  GET_RESULT(self);
+
+  if (wrapper->stmt_wrapper) {
+    rb_raise(cMysql2Error, "write_json is not supported on prepared statement results");
+  }
+  if (wrapper->resultFreed) {
+    rb_raise(cMysql2Error, "Result set has already been freed");
+  }
+  Check_Type(spec, T_ARRAY);
+
+  if (wrapper->numberOfFields == 0) {
+    wrapper->numberOfFields = mysql_num_fields(wrapper->result);
+  }
+
+  /* worst case every entry plus nested entries; a generous fixed ceiling */
+  max_fields = 4096;
+  tab = ALLOCA_N(mysql2_json_field, max_fields);
+  top_n = mysql2_json_compile(spec, tab, &used, max_fields, (unsigned int)wrapper->numberOfFields);
+
+  b.cap = 65536;
+  b.len = 0;
+  b.buf = ALLOC_N(char, b.cap);
+
+  if (!wrapper->is_streaming) {
+    mysql_data_seek(wrapper->result, 0);
+  }
+
+  jbuf_putc(&b, '[');
+  while ((row = mysql_fetch_row(wrapper->result)) != NULL) {
+    unsigned long *lens = mysql_fetch_lengths(wrapper->result);
+    if (!first) jbuf_putc(&b, ',');
+    first = 0;
+    mysql2_json_emit_fields(&b, tab, 0, top_n, row, lens);
+  }
+  jbuf_putc(&b, ']');
+
+  out = rb_utf8_str_new(b.buf, (long)b.len);
+  xfree(b.buf);
+  RB_GC_GUARD(spec);
+  return out;
+}
+
 /* Mysql2::Result */
 VALUE rb_mysql_result_to_obj(VALUE client, VALUE encoding, VALUE options, MYSQL_RES *r, VALUE statement) {
   VALUE obj;
@@ -1651,6 +1873,14 @@ void init_mysql2_result(void) {
   rb_define_method(cMysql2Result, "free", rb_mysql_result_free_, 0);
   rb_define_method(cMysql2Result, "count", rb_mysql_result_count, 0);
   rb_define_alias(cMysql2Result, "size", "count");
+  rb_define_method(cMysql2Result, "write_json", rb_mysql_result_write_json, 1);
+
+  sym_obj   = ID2SYM(rb_intern("obj"));
+  sym_int   = ID2SYM(rb_intern("int"));
+  sym_float = ID2SYM(rb_intern("float"));
+  sym_str   = ID2SYM(rb_intern("str"));
+  sym_bool  = ID2SYM(rb_intern("bool"));
+  sym_raw   = ID2SYM(rb_intern("raw"));
 
   intern_new          = rb_intern("new");
   intern_utc          = rb_intern("utc");
