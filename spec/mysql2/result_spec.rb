@@ -854,7 +854,7 @@ RSpec.describe Mysql2::Result do # rubocop:disable Metrics/BlockLength
     end
   end
 
-  context "row data type mapping" do # rubocop:disable Metrics/BlockLength
+  context "row data type mapping" do
     let(:test_result) { @client.query("SELECT * FROM mysql2_test ORDER BY id DESC LIMIT 1").first }
 
     it "should return nil values for NULL and strings for everything else when :cast is false" do
@@ -1219,14 +1219,6 @@ RSpec.describe Mysql2::Result do # rubocop:disable Metrics/BlockLength
         expect(actual).to eql(expected), "#{literal}: expected #{expected.inspect}, got #{actual.inspect}"
       end
     end
-
-    it "should leave :local DATETIME handling on the generic path" do
-      literal = '2026-07-28 12:34:56'
-      actual = @client.query("SELECT CAST('#{literal}' AS DATETIME) AS t", database_timezone: :local).first['t']
-      expect(actual).to eql(Time.local(2026, 7, 28, 12, 34, 56))
-      expect(actual.utc_offset).to eql(Time.local(2026, 7, 28, 12, 34, 56).utc_offset)
-    end
-
     it "should parse DATE values identically to the sscanf path" do
       # 1000-01-01 and 9999-12-31 are MySQL's DATE range edges.
       ['2026-07-28', '1000-01-01', '9999-12-31'].each do |literal|
@@ -1470,6 +1462,162 @@ RSpec.describe Mysql2::Result do # rubocop:disable Metrics/BlockLength
             end
           end
         end
+      end
+    end
+  end
+
+  # The :local fast path is behavior-preserving by design: every case it
+  # cannot resolve identically to Time.local falls back to the funcall, so
+  # these specs pin parity rather than bite on the path's absence. The
+  # timezone cases run under explicit TZ values because the interesting
+  # edges -- the DST gap, the DST fold, fractional-hour offsets -- only
+  # exist in particular zones.
+  describe "the :local DATETIME fast path" do
+    def with_tz(zone)
+      old = ENV['TZ']
+      ENV['TZ'] = zone
+      yield
+    ensure
+      ENV['TZ'] = old
+    end
+
+    it "should build :local DATETIME values identically to Time.local across the range" do
+      [
+        ['1901-12-13 20:45:51.000000', 0],
+        ['1970-01-01 00:00:00.000001', 1],
+        ['2026-07-28 12:34:56.654321', 654_321],
+        ['2038-01-19 03:14:07.000000', 0],
+        ['2038-01-19 03:14:08.000000', 0],
+      ].each do |literal, usec|
+        y, mo, d, h, mi, s = literal.scan(/\d+/).first(6).map(&:to_i)
+        expected = Time.local(y, mo, d, h, mi, s) + Rational(usec, 1_000_000)
+        actual = @client.query("SELECT CAST('#{literal}' AS DATETIME(6)) AS t", database_timezone: :local).first['t']
+        expect(actual).to eql(expected), "#{literal}: expected #{expected.inspect}, got #{actual.inspect}"
+        expect(actual.utc_offset).to eql(expected.utc_offset)
+        expect(actual.usec).to eql(usec)
+      end
+    end
+
+    it "should match Time.local in DST, fractional-offset, and half-hour-DST zones" do
+      {
+        'UTC'                 => ['2026-06-15 12:34:56', '2026-01-15 00:00:00'],
+        'America/Denver'      => ['2026-06-15 12:34:56', '2026-01-15 00:00:00'],
+        'Asia/Kathmandu'      => ['2026-06-15 12:34:56', '2026-01-15 23:59:59'],
+        'Australia/Lord_Howe' => ['2026-06-15 12:34:56', '2026-01-15 12:00:00'],
+      }.each do |zone, literals|
+        with_tz(zone) do
+          literals.each do |literal|
+            y, mo, d, h, mi, s = literal.scan(/\d+/).map(&:to_i)
+            actual = @client.query("SELECT CAST('#{literal}' AS DATETIME) AS t", database_timezone: :local).first['t']
+            expected = Time.local(y, mo, d, h, mi, s)
+            expect(actual).to eql(expected), "#{zone} #{literal}: expected #{expected.inspect}, got #{actual.inspect}"
+            expect(actual.utc_offset).to eql(expected.utc_offset), "#{zone} #{literal}: offset"
+          end
+        end
+      end
+    end
+
+    it "should resolve a spring-forward gap exactly as Time.local does" do
+      # 02:30 does not exist in Denver on 2026-03-08; mktime would normalize
+      # it, so the fast path declines and the funcall's answer comes back.
+      with_tz('America/Denver') do
+        actual = @client.query("SELECT CAST('2026-03-08 02:30:00' AS DATETIME) AS t", database_timezone: :local).first['t']
+        expect(actual).to eql(Time.local(2026, 3, 8, 2, 30, 0))
+        expect(actual.utc_offset).to eql(Time.local(2026, 3, 8, 2, 30, 0).utc_offset)
+      end
+    end
+
+    it "should resolve a fall-back fold exactly as Time.local does, offset included" do
+      # 01:30 happens twice in Denver on 2026-11-01. Time.local owns the
+      # pick; the fast path must detect the ambiguity and decline, not ship
+      # mktime's implementation-defined choice.
+      with_tz('America/Denver') do
+        actual = @client.query("SELECT CAST('2026-11-01 01:30:00' AS DATETIME) AS t", database_timezone: :local).first['t']
+        expected = Time.local(2026, 11, 1, 1, 30, 0)
+        expect(actual).to eql(expected)
+        expect(actual.utc_offset).to eql(expected.utc_offset)
+      end
+    end
+
+    it "should convert to UTC for application_timezone :utc identically to the funcall path" do
+      actual = @client.query("SELECT CAST('2026-07-28 12:34:56' AS DATETIME) AS t",
+                             database_timezone: :local, application_timezone: :utc,).first['t']
+      expected = Time.local(2026, 7, 28, 12, 34, 56).utc
+      expect(actual).to eql(expected)
+      expect(actual.utc?).to be true
+    end
+
+    it "should leave out-of-Time-range values on the DateTime branch" do
+      actual = @client.query("SELECT CAST('9999-12-31 23:59:59' AS DATETIME) AS t", database_timezone: :local).first['t']
+      expect(actual).to be_an_instance_of(DateTime)
+    end
+
+    it "should leave wall clocks beyond 2037 on the funcall path" do
+      # Past the 32-bit tzdata table horizon Ruby and libc interpret a
+      # zone's extension rule differently in some zones (Nuuk is one), so
+      # the fast path serves only [1970, 2038) and Time.local owns the rest.
+      with_tz('America/Nuuk') do
+        actual = @client.query("SELECT CAST('2038-04-15 12:34:56' AS DATETIME) AS t", database_timezone: :local).first['t']
+        expected = Time.local(2038, 4, 15, 12, 34, 56)
+        expect(actual).to eql(expected)
+        expect(actual.utc_offset).to eql(expected.utc_offset)
+      end
+    end
+
+    it "should serve exactly [1970, 2038) and hand both tails to Time.local" do
+      # The window bounds are measured, not chosen: below 1970 tzdata
+      # answers in Local Mean Time where Ruby maps through congruent modern
+      # years; from 2038, post-table extension rules diverge in four zones.
+      # Values agree on both sides of each bound here (the window is
+      # deliberately conservative), so pinning the PLACEMENT needs a path
+      # assertion: the fallback dispatches through Time.local, the fast
+      # path never does, and a spy tells them apart.
+      with_tz('America/Denver') do
+        {
+          '1969-12-31 23:59:59' => 1, # last pre-window instant: funcall
+          '1970-01-01 00:00:00' => 0, # first served instant
+          '2037-12-31 23:59:59' => 0, # last served instant
+          '2038-01-01 00:00:00' => 1, # first post-window instant: funcall
+        }.each do |literal, funcalls|
+          y, mo, d, h, mi, s = literal.scan(/\d+/).map(&:to_i)
+          expected = Time.local(y, mo, d, h, mi, s)
+          calls = 0
+          allow(Time).to receive(:local).and_wrap_original do |m, *args|
+            calls += 1
+            m.call(*args)
+          end
+          actual = @client.query("SELECT CAST('#{literal}' AS DATETIME) AS t", database_timezone: :local).first['t']
+          RSpec::Mocks.space.proxy_for(Time).reset
+          expect(calls).to eql(funcalls), "#{literal}: expected #{funcalls} Time.local dispatches, saw #{calls}"
+          expect(actual).to eql(expected), "#{literal}: expected #{expected.inspect}, got #{actual.inspect}"
+          expect(actual.utc_offset).to eql(expected.utc_offset)
+        end
+      end
+    end
+
+    it "should build clustered DATETIME values without the funcall path's allocations" do
+      # Proves the fast path actually runs (the parity specs above would
+      # also pass if every value quietly fell back to the funcall). The
+      # funcall path allocates about one extra object per cell, so 2000
+      # clustered cells land near 6000 total; the fast path lands near
+      # 4000. Platforms that cannot compile the fast path keep the
+      # funcall for every :local DATETIME by design.
+      skip 'no :local fast path on this platform' unless Mysql2::Result::LOCAL_DATETIME_FAST_PATH
+      with_tz('America/Denver') do
+        sql = 'SELECT CAST(DATE_ADD(\'2026-01-15 12:00:00\', ' \
+              'INTERVAL a.n + 10 * b.n + 100 * c.n + 1000 * d.n SECOND) AS DATETIME) t ' \
+              'FROM (SELECT 0 n UNION ALL SELECT 1 UNION ALL SELECT 2 UNION ALL SELECT 3 UNION ALL SELECT 4 ' \
+              'UNION ALL SELECT 5 UNION ALL SELECT 6 UNION ALL SELECT 7 UNION ALL SELECT 8 UNION ALL SELECT 9) a, ' \
+              '(SELECT 0 n UNION ALL SELECT 1 UNION ALL SELECT 2 UNION ALL SELECT 3 UNION ALL SELECT 4 ' \
+              'UNION ALL SELECT 5 UNION ALL SELECT 6 UNION ALL SELECT 7 UNION ALL SELECT 8 UNION ALL SELECT 9) b, ' \
+              '(SELECT 0 n UNION ALL SELECT 1 UNION ALL SELECT 2 UNION ALL SELECT 3 UNION ALL SELECT 4 ' \
+              'UNION ALL SELECT 5 UNION ALL SELECT 6 UNION ALL SELECT 7 UNION ALL SELECT 8 UNION ALL SELECT 9) c, ' \
+              '(SELECT 0 n UNION ALL SELECT 1) d'
+        @client.query(sql, database_timezone: :local).to_a
+        GC.start
+        before = GC.stat(:total_allocated_objects)
+        @client.query(sql, database_timezone: :local).to_a
+        expect(GC.stat(:total_allocated_objects) - before).to be < 5000
       end
     end
   end
