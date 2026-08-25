@@ -1620,6 +1620,96 @@ RSpec.describe Mysql2::Result do # rubocop:disable Metrics/BlockLength
         expect(GC.stat(:total_allocated_objects) - before).to be < 5000
       end
     end
+
+    it "should not serve the wrong side of a fold from the edge of a proven offset band" do
+      # The first query proves an offset band whose far edge reaches into the
+      # 2025-11-02 Denver fold's first (MDT) hour. The ambiguous 01:30 then
+      # round-trips as MDT inside that band, but Time.local resolves it to
+      # the later (MST) instant -- the fast path must decline, not serve the
+      # stale side.
+      with_tz('America/Denver') do
+        rows = @client.query("SELECT t FROM (SELECT 1 i, CAST('2025-10-30 19:59:00' AS DATETIME) t " \
+                             "UNION ALL SELECT 2, CAST('2025-11-02 01:30:00' AS DATETIME)) x ORDER BY i",
+                             database_timezone: :local,).to_a
+        expected = Time.local(2025, 11, 2, 1, 30, 0)
+        expect(rows[1]['t']).to eql(expected)
+        expect(rows[1]['t'].utc_offset).to eql(expected.utc_offset)
+      end
+    end
+
+    it "should not serve from a band proven under a different TZ with an equal offset" do
+      # Etc/GMT-1 is fixed +01:00, so its band proof always succeeds. After
+      # switching to Europe/London, the 2025-10-26 fold's BST side also
+      # carries +01:00 -- offset equality alone cannot expose the stale
+      # proof, so the fast path must key its band on the TZ value itself.
+      with_tz('Etc/GMT-1') do
+        rows = []
+        result = @client.query("SELECT t FROM (SELECT 1 i, CAST('2025-10-26 00:30:00' AS DATETIME) t " \
+                               "UNION ALL SELECT 2, CAST('2025-10-26 01:30:00' AS DATETIME)) x ORDER BY i",
+                               database_timezone: :local, cache_rows: false, stream: true,)
+        result.each do |row|
+          rows << row['t']
+          ENV['TZ'] = 'Europe/London' # between the first and second row
+        end
+        expected = Time.local(2025, 10, 26, 1, 30, 0) # under the switched zone
+        expect(rows[1]).to eql(expected)
+        expect(rows[1].utc_offset).to eql(expected.utc_offset)
+      end
+    end
+
+    it "should decline the widest real fold in tzdata (Vostok 1994, seven hours)" do
+      # Antarctica/Vostok fell back seven hours on 1994-01-31 (station
+      # closure), the largest backward step in any zone's [1970, 2038)
+      # history. The priming query's band reaches the fold's +07 side, and
+      # the ambiguous 20:00 must still come back as Time.local's pick.
+      with_tz('Antarctica/Vostok') do
+        rows = @client.query("SELECT t FROM (SELECT 1 i, CAST('1994-01-29 15:00:00' AS DATETIME) t " \
+                             "UNION ALL SELECT 2, CAST('1994-01-31 20:00:00' AS DATETIME)) x ORDER BY i",
+                             database_timezone: :local,).to_a
+        expected = Time.local(1994, 1, 31, 20, 0, 0)
+        expect(rows[1]['t']).to eql(expected)
+        expect(rows[1]['t'].utc_offset).to eql(expected.utc_offset)
+      end
+    end
+
+    it "should leave zones with offsets beyond a day on the funcall path" do
+      # POSIX permits rule offsets up to +/-24:59:59, and past one day
+      # Ruby's own wall-clock mapping stops round-tripping (constructing
+      # Jan 2 under XST+24:00:01 yields a Jan 1 wall clock), so no libc
+      # round-trip can reproduce it. Time.local owns these degenerate zones.
+      with_tz('XST+24:00:01') do
+        actual = @client.query("SELECT CAST('2026-01-02 00:00:00' AS DATETIME) AS t", database_timezone: :local).first['t']
+        expected = Time.local(2026, 1, 2, 0, 0, 0)
+        expect(actual).to eql(expected)
+        expect(actual.utc_offset).to eql(expected.utc_offset)
+      end
+    end
+
+    it "should re-read the zone when TZ returns to the band's value after a detour" do
+      # ENV['TZ'] can go A -> B -> A between rows while some Ruby time call
+      # under B moves libc's cached zone state. The band's TZ string then
+      # matches again, so only an unconditional tzset before re-proving
+      # keeps the probes reading zone A rather than B's leftovers. Apple's
+      # libc re-reads TZ on every localtime_r, so this can only fail on
+      # glibc (the project's Linux CI) -- here it documents the contract.
+      with_tz('America/Denver') do
+        rows = []
+        result = @client.query("SELECT t FROM (SELECT 1 i, CAST('2026-06-15 12:00:00' AS DATETIME) t " \
+                               "UNION ALL SELECT 2, CAST('2026-06-16 12:00:00' AS DATETIME)) x ORDER BY i",
+                               database_timezone: :local, cache_rows: false, stream: true,)
+        result.each do |row|
+          rows << row['t']
+          next unless rows.length == 1
+
+          ENV['TZ'] = 'UTC'
+          Time.now # forces tzset: libc zone state moves to UTC
+          ENV['TZ'] = 'America/Denver' # string restored; libc state may still be UTC
+        end
+        expected = Time.local(2026, 6, 16, 12, 0, 0)
+        expect(rows[1]).to eql(expected)
+        expect(rows[1].utc_offset).to eql(expected.utc_offset)
+      end
+    end
   end
 
   context "string value encodings across character sets" do

@@ -925,17 +925,27 @@ static VALUE mysql2_utc_time(unsigned int year, unsigned int month, unsigned int
  * -01:00 to Ruby, -02:00 to libc). Both sides are internally consistent,
  * so no round-trip can arbitrate; the funcall owns both tails.
  *
- * The proven band and its offset are memoized on the result wrapper:
- * datetime columns cluster in time, so in the common case each cell costs
- * exactly one localtime_r, and concurrently iterated results keep
- * independent proofs instead of evicting each other's. The cache is
- * written under the GVL (this path never releases it). Serving from the
- * band also requires the live tm_gmtoff to equal the band's offset, so a
- * changed zone re-routes into re-proving.
+ * The proven band, its offset, and the TZ environment value it was proven
+ * under are memoized on the result wrapper: datetime columns cluster in
+ * time, so in the common case each cell costs exactly one localtime_r,
+ * and concurrently iterated results keep independent proofs instead of
+ * evicting each other's. The cache is written under the GVL (this path
+ * never releases it). Serving compares the live TZ string against the
+ * memoized copy. It does not compare pointers, because setenv can reuse
+ * the same allocation for a new value; and offset equality alone cannot
+ * distinguish two zones that share an offset but disagree inside a fold.
+ * A changed TZ re-routes into re-proving; staleness costs probes, never a
+ * wrong answer.
  *
  * The remaining Qnil cases mirror mysql2_utc_time: an epoch outside
- * time_t and an out-of-range subsecond. */
+ * time_t, an out-of-range subsecond, plus a TZ value too long to memoize. */
 #define MYSQL2_LOCAL_STABLE_WINDOW (54 * 3600) /* clears any real DST step and fold width */
+/* The margin bounds how close to a proven band's edge a value may be
+ * served, so a transition hiding just past a window endpoint cannot make
+ * an in-band wall time ambiguous: the largest backward step in any zone's
+ * [1970, 2038) history is 7 hours (Antarctica/Vostok, 1994; next largest
+ * 3), and the margin covers it four times over. */
+#define MYSQL2_LOCAL_SERVE_MARGIN (30 * 3600)
 /* Serve window bounds on the wall-clock year. Outside them Ruby and libc
  * disagree in some zones even away from transitions, so the funcall owns
  * both tails. Measured by a dense differential (Time.local vs localtime_r,
@@ -952,14 +962,22 @@ static VALUE mysql2_local_time(mysql2_result_wrapper *wrapper,
                                unsigned long usec) {
   struct timespec ts;
   struct tm chk;
+  const char *tz;
+  size_t tz_len;
   const int64_t wall = mysql2_days_from_civil((int64_t)year, month, day) * 86400LL
                        + hour * 3600 + min * 60 + sec;
   int64_t guess;
   time_t t, edge;
-  int attempt;
+  int attempt, in_band, tz_same;
 
   if (usec >= 1000000UL) return Qnil;
   if (year < MYSQL2_LOCAL_SERVE_YEAR_MIN || year >= MYSQL2_LOCAL_SERVE_YEAR_MAX) return Qnil;
+
+  tz = getenv("TZ");
+  tz_len = tz ? strlen(tz) : 0;
+  if (tz != NULL && tz_len >= sizeof(wrapper->local_band.tz)) return Qnil;
+  tz_same = tz != NULL ? (wrapper->local_band.tz_state == 1 && strcmp(wrapper->local_band.tz, tz) == 0)
+                       : wrapper->local_band.tz_state == 0;
 
   guess = wall - wrapper->local_band.off;
   for (attempt = 0; attempt < 2; attempt++) {
@@ -979,19 +997,40 @@ static VALUE mysql2_local_time(mysql2_result_wrapper *wrapper,
   }
   if (attempt == 2) return Qnil;
 
-  /* The in-band shortcut also demands the live offset still equal the
-   * band's: tm_gmtoff is already in hand, so a zone change that
-   * invalidates the memoized proof re-routes into re-proving instead of
-   * serving. */
-  if (t < wrapper->local_band.lo || t > wrapper->local_band.hi ||
-      chk.tm_gmtoff != wrapper->local_band.off) {
+  /* POSIX rule strings permit offsets up to +/-24:59:59, and beyond one
+   * day Ruby's own wall-clock mapping stops round-tripping, so no libc
+   * agreement can imply Time.local parity there. Real zones stay within
+   * +/-14 hours; anything past a day is Time.local's to interpret. */
+  if (chk.tm_gmtoff >= 86400 || chk.tm_gmtoff <= -86400) return Qnil;
+
+  in_band = tz_same && chk.tm_gmtoff == wrapper->local_band.off &&
+            t >= wrapper->local_band.lo + MYSQL2_LOCAL_SERVE_MARGIN &&
+            t <= wrapper->local_band.hi - MYSQL2_LOCAL_SERVE_MARGIN;
+  if (!in_band) {
     /* Prove the offset constant across the window around t, then memoize
      * the band. Refuse anything near a transition (gap, fold, or a
-     * mid-window offset step) rather than resolving it. */
+     * mid-window offset step) rather than resolving it.
+     *
+     * The tzset is unconditional, not gated on the TZ string differing
+     * from the band's: localtime_r is not required to notice a changed TZ
+     * (glibc's never does -- it skips the implicit tzset that plain
+     * localtime performs), and libc's zone state can have moved and moved
+     * back through values this function never observed. Proving a band
+     * from stale zone state would memoize another zone's offsets under
+     * the live string; refreshing first makes the proof and the string
+     * agree. Serving from an already-proven band needs no refresh: a
+     * stale offset fails the in_band check above and lands here. */
     struct tm lo, hi;
     const int64_t lo64 = (int64_t)t - MYSQL2_LOCAL_STABLE_WINDOW;
     const int64_t hi64 = (int64_t)t + MYSQL2_LOCAL_STABLE_WINDOW;
     if ((int64_t)(time_t)lo64 != lo64 || (int64_t)(time_t)hi64 != hi64) return Qnil;
+    tzset();
+    if (localtime_r(&t, &chk) == NULL) return Qnil;
+    if (chk.tm_year != (int)year - 1900 || chk.tm_mon != (int)month - 1 ||
+        chk.tm_mday != (int)day || chk.tm_hour != (int)hour ||
+        chk.tm_min != (int)min || chk.tm_sec != (int)sec ||
+        chk.tm_gmtoff >= 86400 || chk.tm_gmtoff <= -86400)
+      return Qnil;
     edge = (time_t)lo64;
     if (localtime_r(&edge, &lo) == NULL) return Qnil;
     edge = (time_t)hi64;
@@ -1000,6 +1039,14 @@ static VALUE mysql2_local_time(mysql2_result_wrapper *wrapper,
     wrapper->local_band.lo = (time_t)lo64;
     wrapper->local_band.hi = (time_t)hi64;
     wrapper->local_band.off = chk.tm_gmtoff;
+    if (tz != NULL) {
+      memcpy(wrapper->local_band.tz, tz, tz_len + 1);
+      wrapper->local_band.tz_state = 1;
+    } else {
+      wrapper->local_band.tz_state = 0;
+    }
+    /* t is the band's center, window - margin = 24h inside the serve
+     * interior, so a freshly proven band always serves its own center. */
   }
 
   ts.tv_sec = t;
@@ -2687,6 +2734,7 @@ VALUE rb_mysql_result_to_obj(VALUE client, VALUE encoding, VALUE options, MYSQL_
   wrapper->local_band.lo = 1; /* empty band */
   wrapper->local_band.hi = 0;
   wrapper->local_band.off = 0;
+  wrapper->local_band.tz_state = -1; /* no proof yet */
   wrapper->result = r;
   wrapper->fields = Qnil;
   wrapper->fieldTypes = Qnil;

@@ -50,12 +50,16 @@ typedef struct {
   ID app_timezone; /* Qnil when no conversion applies, as in result_each_args */
 } mysql2_each_opts_cache;
 
-/* One proven timezone-offset band for the :local DATETIME fast path:
- * within [lo, hi] the zone offset is known to be off. Empty when lo > hi. */
+/* One proven timezone-offset band for the :local DATETIME fast path: within
+ * [lo, hi] the zone offset is known to be off, proven under the TZ value
+ * described by tz_state (-1: no proof yet; 0: proven with TZ unset; 1:
+ * proven under the string in tz). Empty when lo > hi. */
 typedef struct {
   time_t lo;
   time_t hi;
   long off;
+  int tz_state;
+  char tz[64];
 } mysql2_local_band;
 
 typedef struct {
