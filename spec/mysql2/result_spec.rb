@@ -1663,6 +1663,9 @@ RSpec.describe Mysql2::Result do # rubocop:disable Metrics/BlockLength
           '2037-12-31 23:59:59' => 0, # last served instant
           '2038-01-01 00:00:00' => 1, # first post-window instant: funcall
         }.each do |literal, funcalls|
+          # Builds without the fast path (Windows CRT) funcall every literal;
+          # there the assertion is that each dispatches exactly once.
+          funcalls = 1 unless Mysql2::Result::LOCAL_DATETIME_FAST_PATH
           y, mo, d, h, mi, s = literal.scan(/\d+/).map(&:to_i)
           expected = Time.local(y, mo, d, h, mi, s)
           calls = 0
