@@ -1659,6 +1659,10 @@ RSpec.describe Mysql2::Result do # rubocop:disable Metrics/BlockLength
       # assertion: the fallback dispatches through Time.local, the fast
       # path never does, and a spy tells them apart.
       with_tz('America/Denver') do
+        # Align libc zone state with the just-changed ENV['TZ'] (see the
+        # drifted-pair spec) so the dispatch counts below are exact on
+        # libcs whose localtime_r skips the implicit tzset.
+        @client.query("SELECT CAST('2026-01-15 12:00:00' AS DATETIME) AS w", database_timezone: :local).first['w']
         {
           '1969-12-31 23:59:59' => 1, # last pre-window instant: funcall
           '1970-01-01 00:00:00' => 0, # first served instant
@@ -1751,6 +1755,12 @@ RSpec.describe Mysql2::Result do # rubocop:disable Metrics/BlockLength
       # would re-prove on every cell and the retirement guard would then
       # push the remainder to the funcall.
       with_tz('America/Denver') do
+        # Align libc's zone state with the just-changed ENV['TZ'] before
+        # counting: on libcs that skip the implicit tzset in localtime_r, a
+        # UTC-shaped wall clock can falsely verify against stale state on
+        # the first cell after a TZ change, and the prove-path's re-verify
+        # then correctly routes that one cell to the funcall.
+        @client.query("SELECT CAST('2026-01-10 07:00:00' AS DATETIME) AS w", database_timezone: :local).first['w']
         eras = Array.new(8) { |i| "SELECT #{i} i, CAST('2026-01-10 08:00:00' AS DATETIME) a, CAST('2026-07-10 09:00:00' AS DATETIME) b" }
         sql = "SELECT a, b FROM (#{eras.join(' UNION ALL ')}) x ORDER BY i"
         calls = 0
